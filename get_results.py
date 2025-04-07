@@ -35,10 +35,9 @@ def test(pred_path, gt_path, retour=False):
         if not gt_file.endswith('.png'):
             continue
 
-        gt_name = gt_file.split('.')[0]
-        gt_img = cv2.imread(os.path.join(gt_path, gt_file), cv2.IMREAD_GRAYSCALE)
-
-        pred = cv2.imread(os.path.join(pred_path, gt_file), cv2.IMREAD_GRAYSCALE)
+        gt_name = gt_file.split('.')[0].split("_")[0] + ".png"
+        gt_img = cv2.imread(os.path.join(gt_path, gt_name), cv2.IMREAD_GRAYSCALE)
+        pred = cv2.imread(os.path.join(pred_path, gt_name), cv2.IMREAD_GRAYSCALE)
         pred[pred==90] = 0
         pred[pred==119] = 255
 
