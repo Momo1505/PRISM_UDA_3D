@@ -224,13 +224,13 @@ class DACS(UDADecorator):
     def train_refinement_source(self, pl_source, sam_source, gt_source, network, optimizer, device): #ADDED
         if network is None : #Initialization du réseau et tutti quanti
             #network = UNet() #For binary
-            network = UNet(n_classes=3) #For multilabel
+            network = UNet(n_classes=19) #For multilabel
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
         
         network.train()
         #ce_loss = torch.nn.BCEWithLogitsLoss() #uncomment for binary
-        ce_loss = torch.nn.CrossEntropyLoss() #For multilabel
+        ce_loss = torch.nn.CrossEntropyLoss(ignore_index=255) #For multilabel
         pl_source = pl_source.unsqueeze(1)
         concat = torch.cat((pl_source, sam_source), dim=1).float()
         

@@ -6,7 +6,7 @@
 _base_ = [
     '../_base_/default_runtime.py',
     # DAFormer Network Architecture
-    '../_base_/models/daformer_sepaspp_mitb5.py',
+    '../_base_/models/deeplabv3plus_r50-d8.py',
     # GTA->Cityscapes High-Resolution Data Loading
     '../_base_/datasets/uda_GTA_to_Cityscapes.py',
     # DAFormer Self-Training
