@@ -16,7 +16,7 @@ from mmcv.utils import DictAction
 from mmseg.apis import multi_gpu_test, single_gpu_test
 from mmseg.datasets import build_dataloader, build_dataset
 from mmseg.models import build_segmentor
-
+import pdb
 
 def update_legacy_cfg(cfg):
     # The saved json config does not differentiate between list and tuple
@@ -216,6 +216,7 @@ def main():
 
     if not distributed:
         model = MMDataParallel(model, device_ids=[0])
+        pdb.set_trace()
         outputs = single_gpu_test(model, data_loader, args.show, args.show_dir,
                                   efficient_test, args.opacity)
     else:
@@ -223,6 +224,7 @@ def main():
             model.cuda(),
             device_ids=[torch.cuda.current_device()],
             broadcast_buffers=False)
+        pdb.set_trace()
         outputs = multi_gpu_test(model, data_loader, args.tmpdir,
                                  args.gpu_collect, efficient_test)
 

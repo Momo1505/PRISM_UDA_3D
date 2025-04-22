@@ -38,7 +38,7 @@ from mmseg.models.utils.dacs_transforms import (denorm, get_class_masks,
                                                 get_mean_std, strong_transform)
 from mmseg.models.utils.visualization import prepare_debug_out, subplotimg
 from mmseg.utils.utils import downscale_label_ratio
-
+from plot import save_segmentation_map
 from mmseg.models.segmentors.base import UNet
 
 
@@ -476,6 +476,8 @@ class DACS(UDADecorator):
             pseudo_label, pseudo_weight = self.get_pseudo_label_and_weight(
                 ema_logits)
             del ema_logits
+            if self.local_iter > 400 and self.local_iter <=500: 
+                save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/ema_iter_{self.local_iter}")
 
             pseudo_weight = self.filter_valid_pseudo_region(
                 pseudo_weight, valid_pseudo_mask)
@@ -520,69 +522,69 @@ class DACS(UDADecorator):
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
             #if (self.local_iter < 7500):
-            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and self.local_iter < 7500):
-                self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev)
+            #if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and self.local_iter < 7500):
+            self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev)
 
             #if (self.local_iter < 7500):
-            if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) :
-                with torch.no_grad():
-                    self.network.eval()
-                    pseudo_label = pseudo_label.unsqueeze(1)
-                    concat = torch.cat((pseudo_label, target_sam), dim=1).float()
-                    pseudo_label_ref = self.network(concat)
-                    pseudo_label = pseudo_label.squeeze(1)
+            #if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) :
+            with torch.no_grad():
+                self.network.eval()
+                pseudo_label = pseudo_label.unsqueeze(1)
+                concat = torch.cat((pseudo_label, target_sam), dim=1).float()
+                pseudo_label_ref = self.network(concat)
+                pseudo_label = pseudo_label.squeeze(1)
 
-                    softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+                softmax = torch.nn.Softmax(dim=1)
+                pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
 
-                    #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
-                    #plt.show()
-                    #print("unique value", np.unique(pseudo_label.cpu().numpy()))
-                    #print("shape", np.shape(pseudo_label_ref.cpu().numpy()))
+                #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
+                #plt.show()
+                #print("unique value", np.unique(pseudo_label.cpu().numpy()))
+                #print("shape", np.shape(pseudo_label_ref.cpu().numpy()))
 
-                for j in range(batch_size):
-                    rows, cols = 1, 5  # Increase cols to 4 for the new plot
-                    fig, axs = plt.subplots(
-                        rows,
-                        cols,
-                        figsize=(3 * cols, 3 * rows),
-                        gridspec_kw={
-                            'hspace': 0.1,
-                            'wspace': 0.05,
-                            'top': 0.95,
-                            'bottom': 0.05,
-                            'right': 0.95,
-                            'left': 0.05
-                        },
-                    )
+            for j in range(batch_size):
+                rows, cols = 1, 5  # Increase cols to 4 for the new plot
+                fig, axs = plt.subplots(
+                    rows,
+                    cols,
+                    figsize=(3 * cols, 3 * rows),
+                    gridspec_kw={
+                        'hspace': 0.1,
+                        'wspace': 0.05,
+                        'top': 0.95,
+                        'bottom': 0.05,
+                        'right': 0.95,
+                        'left': 0.05
+                    },
+                )
 
-                    # Plot the images
-                    axs[0].imshow(target_img[j].cpu().numpy()[0, :, :])
-                    axs[0].set_title('Target Image')
+                # Plot the images
+                axs[0].imshow(target_img[j].cpu().numpy()[0, :, :])
+                axs[0].set_title('Target Image')
 
-                    axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap='gray')
-                    axs[1].set_title('Pseudo Label')
+                axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap='gray')
+                axs[1].set_title('Pseudo Label')
 
-                    axs[2].imshow(target_sam[j].cpu().numpy()[0, :, :], cmap='gray')
-                    axs[2].set_title('Target SAM')
+                axs[2].imshow(target_sam[j].cpu().numpy()[0, :, :], cmap='gray')
+                axs[2].set_title('Target SAM')
 
-                    axs[3].imshow(pseudo_label_ref[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
-                    axs[3].set_title('Pseudo Label Ref')
+                axs[3].imshow(pseudo_label_ref[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
+                axs[3].set_title('Pseudo Label Ref')
 
-                    axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
-                    axs[4].set_title('pl_after_post')
+                axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
+                axs[4].set_title('pl_after_post')
 
-                    # Turn off axis for all subplots
-                    for ax in axs.flat:
-                        ax.axis('off')
+                # Turn off axis for all subplots
+                for ax in axs.flat:
+                    ax.axis('off')
 
-                    # Save the figure
-                    out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
-                    os.makedirs(out_dir, exist_ok=True)
-                    plt.savefig(
-                        os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
-                    )
-                    plt.close()
+                # Save the figure
+                out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+                os.makedirs(out_dir, exist_ok=True)
+                plt.savefig(
+                    os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
+                )
+                plt.close()
 
                 #For binary segmentation
                 #target_sam = target_sam.squeeze(1)  # Removes the singleton dimension
@@ -591,6 +593,8 @@ class DACS(UDADecorator):
                 #For multilabel segmentation
                 softmax = torch.nn.Softmax(dim=1)
                 pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+                if self.local_iter > 400 and self.local_iter <=500: 
+                    save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/pl_raffiné_{self.local_iter}")
 
                 #Let it uncommented for both
                 pseudo_label = pseudo_label.squeeze(1)
