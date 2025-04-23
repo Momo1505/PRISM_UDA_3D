@@ -96,8 +96,8 @@ n_gpus = 1
 gpu_model = 'NVIDIATITANRTX'
 runner = dict(type='IterBasedRunner', max_iters=30000)
 # Logging Configuration
-checkpoint_config = dict(by_epoch=False, interval=5000, max_keep_ckpts=3,save_best='mIoU')
-evaluation = dict(interval=4000, metric='mIoU',save_best='mIoU',rule='greater')
+checkpoint_config = dict(by_epoch=False, interval=5000, max_keep_ckpts=3,)
+evaluation = dict(interval=4000, metric='mIoU')
 # Meta Information for Result Analysis
 name = 'GTAtoCityscapes'
 exp = 'basic'

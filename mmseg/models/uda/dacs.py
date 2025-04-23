@@ -476,8 +476,7 @@ class DACS(UDADecorator):
             pseudo_label, pseudo_weight = self.get_pseudo_label_and_weight(
                 ema_logits)
             del ema_logits
-            if self.local_iter > 400 and self.local_iter <=500: 
-                save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/ema_iter_{self.local_iter}")
+            save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/ema_iter_{self.local_iter}")
 
             pseudo_weight = self.filter_valid_pseudo_region(
                 pseudo_weight, valid_pseudo_mask)
@@ -593,8 +592,7 @@ class DACS(UDADecorator):
                 #For multilabel segmentation
                 softmax = torch.nn.Softmax(dim=1)
                 pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
-                if self.local_iter > 400 and self.local_iter <=500: 
-                    save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/pl_raffiné_{self.local_iter}")
+                save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/pl_raffiné_{self.local_iter}")
 
                 #Let it uncommented for both
                 pseudo_label = pseudo_label.squeeze(1)
