@@ -40,6 +40,10 @@ from mmseg.models.utils.visualization import prepare_debug_out, subplotimg
 from mmseg.utils.utils import downscale_label_ratio
 from plot import save_segmentation_map
 from mmseg.models.segmentors.base import UNet
+import torch.nn as nn
+from matplotlib.colors import ListedColormap
+from mmseg.datasets import CityscapesDataset
+import json
 
 
 def _params_equal(ema_model, model):
@@ -107,6 +111,12 @@ class DACS(UDADecorator):
         self.optimizer = None
         self.masked_loss_list = []
         self.refin_loss_list = []
+
+        # getting the type of refinement
+        self.attention_type = cfg["attention_type"]
+
+        with open("data/gta/sample_class_stats_dict.json","r") as of:
+            self.sample_class_dict = json.load(of)
 
     def get_ema_model(self):
         return get_module(self.ema_model)
@@ -183,7 +193,7 @@ class DACS(UDADecorator):
         
         Parameters:
             loss_values (list): List of loss values recorded over epochs.
-            out_dir (str): Directory to save the loss plot.
+            out_dir (str): Directory to save  the loss plot.
             plot_name (str): Filename for the saved loss plot.
             loss_label (str): Label for the loss on the y-axis.
         """
@@ -221,20 +231,21 @@ class DACS(UDADecorator):
         # Return True if sliding mean has decreased
         return second_half_mean < first_half_mean
     
-    def train_refinement_source(self, pl_source, sam_source, gt_source, network, optimizer, device): #ADDED
+    def train_refinement_source(self, pl_source, sam_source, gt_source, network, optimizer, device,class_weight): #ADDED
         if network is None : #Initialization du réseau et tutti quanti
             #network = UNet() #For binary
-            network = UNet(n_classes=19) #For multilabel
+            #network = UNet(n_classes=19) #For multilabel
+            network = Refinement(pl_source.shape[-1],self.attention_type)
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
         
         network.train()
         #ce_loss = torch.nn.BCEWithLogitsLoss() #uncomment for binary
-        ce_loss = torch.nn.CrossEntropyLoss(ignore_index=255) #For multilabel
+        ce_loss = nn.CrossEntropyLoss(ignore_index=255,weight=class_weight.to(device)) #For multilabel
         pl_source = pl_source.unsqueeze(1)
-        concat = torch.cat((pl_source, sam_source), dim=1).float()
+        #concat = torch.cat((pl_source, sam_source), dim=1).float()
         
-        pred = network(concat)
+        pred = network(pl_source,sam_source)
         print("pred_shape", pred.shape, "pred_unique", np.unique(pred.detach().cpu().numpy()))
         print("pred_shape", gt_source.shape, "pred_unique", np.unique(gt_source.detach().cpu().numpy()))
         #loss = ce_loss(pred, gt_source.float()) #uncomment for binary
@@ -397,6 +408,21 @@ class DACS(UDADecorator):
         #plt.imshow(target_sam.cpu().numpy()[0,0,:,:])
         #plt.show()
 
+        # code to obtain the class weight for the current image
+        filename = img_metas[0]["filename"]
+        oriname = img_metas[0]["ori_filename"]
+        new_name=oriname.replace(".png","_labelTrainIds.png")
+
+        gt_filename = filename.replace(f"images/{oriname}",f'labels/{new_name}')
+        gt_class_stats = self.sample_class_dict[gt_filename]
+        gt_class_stats = {int(k): v for k,v in gt_class_stats.items()}
+
+        gt_class_weights = [gt_class_stats.get(i,0) for i in range(19) ]
+        gt_class_weights = torch.tensor([1/weight if weight!=0 else weight for weight in gt_class_weights])
+
+        palette = CityscapesDataset.PALETTE
+        cityscapes_cmap = ListedColormap(np.array(palette) / 255.0)
+
         log_vars = {}
         batch_size = img.shape[0]
         dev = img.device
@@ -476,7 +502,10 @@ class DACS(UDADecorator):
             pseudo_label, pseudo_weight = self.get_pseudo_label_and_weight(
                 ema_logits)
             del ema_logits
-            save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/ema_iter_{self.local_iter}")
+            out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+            os.makedirs(out_dir, exist_ok=True)
+            save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(), os.path.join(out_dir,
+                                     f'{(self.local_iter + 1):06d}_ema.png'))
 
             pseudo_weight = self.filter_valid_pseudo_region(
                 pseudo_weight, valid_pseudo_mask)
@@ -521,81 +550,84 @@ class DACS(UDADecorator):
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
             #if (self.local_iter < 7500):
-            #if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and self.local_iter < 7500):
-            self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev)
+            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and self.local_iter < 12500):
+                self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev,gt_class_weights)
 
             #if (self.local_iter < 7500):
-            #if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) :
-            with torch.no_grad():
-                self.network.eval()
-                pseudo_label = pseudo_label.unsqueeze(1)
-                concat = torch.cat((pseudo_label, target_sam), dim=1).float()
-                pseudo_label_ref = self.network(concat)
-                pseudo_label = pseudo_label.squeeze(1)
+            if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) :
+                with torch.no_grad():
+                    self.network.eval()
+                    pseudo_label = pseudo_label.unsqueeze(1)
+                    #concat = torch.cat((pseudo_label, target_sam), dim=1).float()
+                    pseudo_label_ref = self.network(pseudo_label,target_sam)
+                    pseudo_label = pseudo_label.squeeze(1)
 
-                softmax = torch.nn.Softmax(dim=1)
-                pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+                    softmax = torch.nn.Softmax(dim=1)
+                    pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
 
-                #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
-                #plt.show()
-                #print("unique value", np.unique(pseudo_label.cpu().numpy()))
-                #print("shape", np.shape(pseudo_label_ref.cpu().numpy()))
+                    #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
+                    #plt.show()
+                    #print("unique value", np.unique(pseudo_label.cpu().numpy()))
+                    #print("shape", np.shape(pseudo_label_ref.cpu().numpy()))
 
-            for j in range(batch_size):
-                rows, cols = 1, 5  # Increase cols to 4 for the new plot
-                fig, axs = plt.subplots(
-                    rows,
-                    cols,
-                    figsize=(3 * cols, 3 * rows),
-                    gridspec_kw={
-                        'hspace': 0.1,
-                        'wspace': 0.05,
-                        'top': 0.95,
-                        'bottom': 0.05,
-                        'right': 0.95,
-                        'left': 0.05
-                    },
-                )
+                for j in range(batch_size):
+                    rows, cols = 1, 5  # Increase cols to 4 for the new plot
+                    fig, axs = plt.subplots(
+                        rows,
+                        cols,
+                        figsize=(3 * cols, 3 * rows),
+                        gridspec_kw={
+                            'hspace': 0.1,
+                            'wspace': 0.05,
+                            'top': 0.95,
+                            'bottom': 0.05,
+                            'right': 0.95,
+                            'left': 0.05
+                        },
+                    )
 
-                # Plot the images
-                axs[0].imshow(target_img[j].cpu().numpy()[0, :, :])
-                axs[0].set_title('Target Image')
+                    # Plot the images
+                    axs[0].imshow(target_img[j].cpu().numpy()[0, :, :])
+                    axs[0].set_title('Target Image')
 
-                axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap='gray')
-                axs[1].set_title('Pseudo Label')
+                    subplotimg(axs[1],pseudo_label[j].cpu().numpy()[:, :],'Pseudo Label')
+                    #axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap=cityscapes_cmap)
+                    #axs[1].set_title('Pseudo Label')
 
-                axs[2].imshow(target_sam[j].cpu().numpy()[0, :, :], cmap='gray')
-                axs[2].set_title('Target SAM')
+                    axs[2].imshow(target_sam[j].cpu().numpy()[0, :, :], cmap='gray')
+                    axs[2].set_title('Target SAM')
 
-                axs[3].imshow(pseudo_label_ref[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
-                axs[3].set_title('Pseudo Label Ref')
+                    axs[3].imshow(pseudo_label_ref[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
+                    axs[3].set_title('Pseudo Label Ref')
 
-                axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
-                axs[4].set_title('pl_after_post')
+                    subplotimg(axs[4],pseudo_label_ref2[j].cpu().numpy()[:, :],'pl_after_post')
+                    # axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap=cityscapes_cmap)  # New plot
+                    # axs[4].set_title('pl_after_post')
 
-                # Turn off axis for all subplots
-                for ax in axs.flat:
-                    ax.axis('off')
+                    # Turn off axis for all subplots
+                    for ax in axs.flat:
+                        ax.axis('off')
 
-                # Save the figure
-                out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
-                os.makedirs(out_dir, exist_ok=True)
-                plt.savefig(
-                    os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
-                )
-                plt.close()
+                    # Save the figure
+                    out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+                    os.makedirs(out_dir, exist_ok=True)
+                    plt.savefig(
+                        os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
+                    )
+                    plt.close()
 
-                #For binary segmentation
-                #target_sam = target_sam.squeeze(1)  # Removes the singleton dimension
-                #pseudo_label = (pseudo_label_ref.squeeze(1)>0.5).long()
-                
-                #For multilabel segmentation
-                softmax = torch.nn.Softmax(dim=1)
-                pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
-                save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(),f"data/debug/pl_raffiné_{self.local_iter}")
+                    #For binary segmentation
+                    #target_sam = target_sam.squeeze(1)  # Removes the singleton dimension
+                    #pseudo_label = (pseudo_label_ref.squeeze(1)>0.5).long()
+                    
+                    #For multilabel segmentation
+                    softmax = torch.nn.Softmax(dim=1)
+                    pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+                    save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(), os.path.join(out_dir,
+                                        f'{(self.local_iter + 1):06d}_pl_raffiné.png'))
 
-                #Let it uncommented for both
-                pseudo_label = pseudo_label.squeeze(1)
+                    #Let it uncommented for both
+                    pseudo_label = pseudo_label.squeeze(1)
                 
 
             # Apply mixing
@@ -752,3 +784,192 @@ class DACS(UDADecorator):
         self.local_iter += 1
 
         return log_vars
+    
+class Refinement(nn.Module):
+    def __init__(self, dim,attention_type:str):
+        super().__init__()
+        self.attention_type = attention_type
+
+        self.attention = AttentionBlock(dim,attention_type)
+        self.unet = UNet(in_channel=1,n_classes=19)
+
+    def forward(self, pl_source, sam_source):
+        pl_source = pl_source.float()
+        sam_source = sam_source.float()
+
+        # Extract features
+        feats = self.attention(pl_source,sam_source)
+
+        if self.attention_type == "simple_cross_attention":
+            out = feats * sam_source + (1-feats)*pl_source
+            out = self.unet(out)
+        elif self.attention_type == "convolutional_cross_attention":
+            out = feats
+
+        return out
+
+class CrossAttention(nn.Module):
+    def __init__(self,
+                 embed_dim:int,
+                 qkv_bias=False,
+                 drop_rate=0.1
+                 ):
+        super().__init__()
+        self.W_query = nn.Linear(embed_dim,embed_dim,bias=qkv_bias)
+        self.W_key = nn.Linear(embed_dim,embed_dim,bias=qkv_bias)
+        self.W_value = nn.Linear(embed_dim,embed_dim,bias=qkv_bias)
+
+        self.att_layer_norm = nn.LayerNorm(embed_dim)
+        self.dropout = nn.Dropout(drop_rate)
+
+        self.ff = nn.Sequential(
+            nn.Linear(embed_dim,2*embed_dim,bias=qkv_bias),
+            nn.Linear(2*embed_dim,embed_dim,bias=qkv_bias)
+        )
+        self.ff_dropout =  nn.Dropout(drop_rate)
+        self.ff_layer_norm = nn.LayerNorm(embed_dim)
+
+
+    def compute_att(self,query,key,value):
+        attention_scores:torch.Tensor = (query @ key.transpose(-2,-1)) / query.shape[-1]**0.5
+        attention_scores = attention_scores.view(attention_scores.size(0),-1)
+        attention_weights = attention_scores.contiguous().softmax(dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        attention_weights = attention_weights.view_as(query).contiguous()
+
+        attention = attention_weights @ value
+        return attention
+        
+    
+    def forward(self,
+                pl_source:torch.Tensor,
+                sam_source:torch.Tensor
+                ):
+        query:torch.Tensor = self.W_query(pl_source)
+        key:torch.Tensor = self.W_key(sam_source)
+        value:torch.Tensor = self.W_value(sam_source)
+
+        attention = self.compute_att(query,key,value)
+        
+        attention = self.att_layer_norm(attention+pl_source)
+
+        out = self.ff(attention)
+        out = self.ff_dropout(out)
+
+        return self.ff_layer_norm(out+attention)
+
+class AttentionBlock(nn.Module):
+    def __init__(self,
+                 embed_dim:int,
+                 attention_type:str,
+                 qkv_bias=False,
+                 drop_rate=0.1,
+                 num_blocks=12):
+        super().__init__()
+        self.attention_type = attention_type
+        if attention_type == "simple_cross_attention":
+            self.layers = nn.ModuleList([CrossAttention(embed_dim,qkv_bias,drop_rate) for _ in range(num_blocks)])
+        elif attention_type == "convolutional_cross_attention":
+            self.scaling_pl_source = nn.Conv2d(in_channels=1,out_channels=19,kernel_size=1,stride=1)
+            self.scaling_sam_source = nn.Conv2d(in_channels=1,out_channels=19,kernel_size=1,stride=1)
+
+            self.sam_attention = nn.ModuleList([ConvolutionalCrossAttention(embed_dim) for _ in range(2)])
+            self.pl_attention = nn.ModuleList([ConvolutionalCrossAttention(embed_dim) for _ in range(2)])
+            self.layers = nn.ModuleList([ConvolutionalCrossAttention(embed_dim) for _ in range(3)])
+
+
+    def go_forward(self,x,type):
+        module = self.sam_attention if type=="sam" else self.pl_attention
+        x,_ = x
+        for layer in module:
+            x = layer(x,x)
+        return x
+        
+
+    def forward(self,pl_source:torch.Tensor,
+                sam_source:torch.Tensor):
+        if self.attention_type == "simple_cross_attention":
+            x = pl_source
+            for layer in self.layers:
+                x = layer(x,sam_source)
+            x = x.sigmoid()
+        elif self.attention_type == "convolutional_cross_attention":
+            pl_source = self.scaling_pl_source(pl_source)
+            sam_source = self.scaling_sam_source(sam_source)
+            sam_attention = self.go_forward((sam_source,sam_source),"sam")
+            x = pl_source
+            for layer in self.layers:
+                x = self.go_forward((x,x),"pl")
+                x = layer(x,sam_attention)
+        
+        return x
+
+class ConvolutionalCrossAttention(nn.Module):
+    def __init__(self,image_size:int,drop_rate=0.1):
+        super().__init__()
+
+        self.image_size = image_size
+
+        self.W_query = nn.Sequential(
+            nn.Conv2d(in_channels=19,out_channels=3,kernel_size=3,stride=1,padding=1),
+            nn.Conv2d(in_channels=3,out_channels=9,kernel_size=3,stride=1,padding=1),
+            nn.Conv2d(in_channels=9,out_channels=19,kernel_size=3,stride=1,padding=1)
+        )
+
+        self.W_key = nn.Sequential(
+            nn.Conv2d(in_channels=19,out_channels=3,kernel_size=3,stride=1,padding=1),
+            nn.Conv2d(in_channels=3,out_channels=9,kernel_size=3,stride=1,padding=1),
+            nn.Conv2d(in_channels=9,out_channels=19,kernel_size=3,stride=1,padding=1)
+        )
+
+        self.W_value = nn.Sequential(
+            nn.Conv2d(in_channels=19,out_channels=3,kernel_size=3,stride=1,padding=1),
+            nn.Conv2d(in_channels=3,out_channels=9,kernel_size=3,stride=1,padding=1),
+            nn.Conv2d(in_channels=9,out_channels=19,kernel_size=3,stride=1,padding=1)
+        )
+
+        self.sam_norm = nn.LayerNorm((image_size,image_size))
+        self.pl_norm = nn.LayerNorm((image_size,image_size))
+
+        self.dropout = nn.Dropout(drop_rate)
+
+        self.ff = nn.Sequential(
+            nn.Linear(image_size,image_size*2,bias=False),nn.Linear(2*image_size,image_size,bias=False)
+        )
+        self.ff_dropout =  nn.Dropout(drop_rate)
+        self.ff_layer_norm = nn.LayerNorm((image_size,image_size))
+    
+    def compute_att(self,query:torch.Tensor,key:torch.Tensor,value:torch.Tensor):
+        batch_size = query.size(0)
+        channels = query.size(1)
+
+        query = query.view(batch_size,channels,-1).contiguous() # batch,channels,1024**2
+        key = key.view(batch_size,channels,-1).contiguous() # batch,channels,1024**2
+        value = value.view(batch_size,channels,-1).contiguous() # batch,channels,1024**2
+
+        attention_scores:torch.Tensor = (query @ key.transpose(-2,-1).contiguous()) / query.shape[-1]**0.5 # batch,channels,channels
+        attention_weights = attention_scores.contiguous().softmax(dim=-1)
+        attention_weights = self.dropout(attention_weights)
+
+        attention = attention_weights @ value # batch,1024,channels,1024
+        return attention.view(batch_size,channels,self.image_size,self.image_size).contiguous()
+    
+    def forward(self,
+                pl_source:torch.Tensor,
+                sam_source:torch.Tensor
+                ):
+        
+        sam_source = self.sam_norm(sam_source)
+        pl_source = self.pl_norm(pl_source)
+
+        query:torch.Tensor = self.W_query(pl_source)
+        key:torch.Tensor = self.W_key(sam_source)
+        value:torch.Tensor = self.W_value(sam_source)
+
+        attention = self.compute_att(query,key,value)
+
+        attention = self.ff_layer_norm(pl_source+attention)
+        out = self.ff(attention)
+        out = self.ff_dropout(out+attention)
+
+        return out

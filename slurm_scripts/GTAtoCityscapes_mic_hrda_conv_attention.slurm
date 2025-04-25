@@ -10,7 +10,7 @@
 #SBATCH --constraint="gpua100"
 #SBATCH --mail-user="mouhamed.sow@unistra.fr"
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH -o jobs/GTA_to_Cityscapes_mic_hrda.out
+#SBATCH -o jobs/GTA_to_Cityscapes_mic_hrda_conv_attention.out
 
 # +------------------------------------------------------------------------------------+ #
 # |                                ENVIRONNEMENT SET UP                                | #
@@ -43,5 +43,5 @@ GPU VRAM.........: $vram_total
 export CUDA_LAUNCH_BLOCKING=1
 
 echo 'START'
-python run_experiments.py --config configs/mic/GTAtoCityscapes.py
+python run_experiments.py --config configs/mic/GTAtoCityscapes_attention.py
 echo 'END'

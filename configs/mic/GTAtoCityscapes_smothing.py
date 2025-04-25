@@ -6,7 +6,7 @@
 _base_ = [
     '../_base_/default_runtime.py',
     # DAFormer Network Architecture
-    '../_base_/models/deeplabv3plus_r50-d8.py',
+    '../_base_/models/daformer_sepaspp_mitb5.py',
     # GTA->Cityscapes High-Resolution Data Loading
     '../_base_/datasets/uda_GTA_to_Cityscapes.py',
     # DAFormer Self-Training
@@ -81,8 +81,9 @@ uda = dict(
     mask_lambda=1,
     # Use random patch masking with a patch size of 64x64
     # and a mask ratio of 0.7
-    mask_generator=dict(
-        type='block', mask_ratio=0.7, mask_block_size=64, _delete_=True))
+    mask_generator=dict(type='block', mask_ratio=0.7, mask_block_size=64, _delete_=True),
+    attention_type = "simple_cross_attention",
+    smoothing=0.1)
 # Optimizer Hyperparameters
 optimizer_config = None
 optimizer = dict(
@@ -96,7 +97,7 @@ n_gpus = 1
 gpu_model = 'NVIDIATITANRTX'
 runner = dict(type='IterBasedRunner', max_iters=30000)
 # Logging Configuration
-checkpoint_config = dict(by_epoch=False, interval=5000, max_keep_ckpts=3)
+checkpoint_config = dict(by_epoch=False, interval=5000, max_keep_ckpts=3,)
 evaluation = dict(interval=4000, metric='mIoU')
 # Meta Information for Result Analysis
 name = 'GTAtoCityscapes'
