@@ -44,6 +44,8 @@ import torch.nn as nn
 from matplotlib.colors import ListedColormap
 from mmseg.datasets import CityscapesDataset
 import json
+from mmseg.models.uda.refinement import EncodeDecode
+from mmseg.models.uda.swinir_backbone import MGDNRefinement
 
 
 def _params_equal(ema_model, model):
@@ -235,7 +237,7 @@ class DACS(UDADecorator):
         if network is None : #Initialization du réseau et tutti quanti
             #network = UNet() #For binary
             #network = UNet(n_classes=19) #For multilabel
-            network = Refinement(pl_source.shape[-1],self.attention_type)
+            network = Refinement(pl_source.shape[-1],self.attention_type,device)
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
         
@@ -417,8 +419,24 @@ class DACS(UDADecorator):
         gt_class_stats = self.sample_class_dict[gt_filename]
         gt_class_stats = {int(k): v for k,v in gt_class_stats.items()}
 
-        gt_class_weights = [gt_class_stats.get(i,0) for i in range(19) ]
-        gt_class_weights = torch.tensor([1/weight if weight!=0 else weight for weight in gt_class_weights])
+        # Invert class frequencies
+        gt_class_weights = [gt_class_stats.get(i, 0) for i in range(19)]
+        gt_class_weights = [1/weight if weight != 0 else 0 for weight in gt_class_weights]
+
+        # Convert to tensor
+        weights = torch.tensor(gt_class_weights)
+
+        # Avoid zeros for normalization
+        nonzero_weights = weights[weights > 0]
+        min_w, max_w = nonzero_weights.min(), nonzero_weights.max()
+
+        # Rescale to [1, 5]
+        gt_class_weights = torch.where(
+            weights > 0,
+            1 + 4 * (weights - min_w) / (max_w - min_w),
+            torch.tensor(0.0)  
+        )
+
 
         palette = CityscapesDataset.PALETTE
         cityscapes_cmap = ListedColormap(np.array(palette) / 255.0)
@@ -786,27 +804,65 @@ class DACS(UDADecorator):
         return log_vars
     
 class Refinement(nn.Module):
-    def __init__(self, dim,attention_type:str):
+    def __init__(self, dim,attention_type:str,device):
         super().__init__()
         self.attention_type = attention_type
 
-        self.attention = AttentionBlock(dim,attention_type)
+        if attention_type == "MGDN":
+            self.autoencoder = MGDNRefinement()
+
+        if attention_type == "encode_decode":
+            self.autoencoder = EncodeDecode(device)
+
+        if attention_type not in ("no_sam", "encode_decode","MGDN") : 
+            self.attention = AttentionBlock(dim,attention_type) 
         self.unet = UNet(in_channel=1,n_classes=19)
+        if self.attention_type == "convolutional_cross_attention":
+            self.decode = Decoder()
 
     def forward(self, pl_source, sam_source):
         pl_source = pl_source.float()
         sam_source = sam_source.float()
 
         # Extract features
-        feats = self.attention(pl_source,sam_source)
+        if self.attention_type not in ("no_sam", "encode_decode","MGDN"):   
+            feats = self.attention(pl_source,sam_source)
 
         if self.attention_type == "simple_cross_attention":
             out = feats * sam_source + (1-feats)*pl_source
             out = self.unet(out)
         elif self.attention_type == "convolutional_cross_attention":
             out = feats
+            out = self.decode(out)
+            out = out * sam_source + (1-out)*pl_source
+            out = self.unet(out)
+
+        if self.attention_type not in ("no_sam", "encode_decode","MGDN") : 
+            out = self.unet(pl_source)
+        
+        if self.attention_type == "encode_decode":
+            out = self.autoencoder(sam_source,pl_source)
+        
+        if self.attention_type == "MGDN":
+            out = self.autoencoder(sam_source,pl_source)
 
         return out
+
+class Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.module = nn.Sequential(
+            nn.ConvTranspose2d(762, 512, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(128, 1, kernel_size=4, stride=2, padding=1)
+        )
+    def forward(self,latent_space):
+        
+        return self.module(latent_space)
 
 class CrossAttention(nn.Module):
     def __init__(self,
@@ -870,12 +926,13 @@ class AttentionBlock(nn.Module):
         if attention_type == "simple_cross_attention":
             self.layers = nn.ModuleList([CrossAttention(embed_dim,qkv_bias,drop_rate) for _ in range(num_blocks)])
         elif attention_type == "convolutional_cross_attention":
-            self.scaling_pl_source = nn.Conv2d(in_channels=1,out_channels=19,kernel_size=1,stride=1)
-            self.scaling_sam_source = nn.Conv2d(in_channels=1,out_channels=19,kernel_size=1,stride=1)
+            self.positional_embed = nn.Parameter(torch.randn((1,762,64,64)))
+            self.scaling_pl_source = nn.Conv2d(1,762,kernel_size=16,stride=16)
+            self.scaling_sam_source = nn.Conv2d(1,762,kernel_size=16,stride=16)
 
-            self.sam_attention = nn.ModuleList([ConvolutionalCrossAttention(embed_dim) for _ in range(2)])
-            self.pl_attention = nn.ModuleList([ConvolutionalCrossAttention(embed_dim) for _ in range(2)])
-            self.layers = nn.ModuleList([ConvolutionalCrossAttention(embed_dim) for _ in range(3)])
+            self.sam_attention = nn.ModuleList([ConvolutionalCrossAttention() for _ in range(3)])
+            self.pl_attention = nn.ModuleList([ConvolutionalCrossAttention() for _ in range(6)])
+            self.layers = nn.ModuleList([ConvolutionalCrossAttention() for _ in range(6)])
 
 
     def go_forward(self,x,type):
@@ -894,70 +951,60 @@ class AttentionBlock(nn.Module):
                 x = layer(x,sam_source)
             x = x.sigmoid()
         elif self.attention_type == "convolutional_cross_attention":
-            pl_source = self.scaling_pl_source(pl_source)
-            sam_source = self.scaling_sam_source(sam_source)
+            pl_source = self.scaling_pl_source(pl_source) + self.positional_embed #(batch,embed_dim,64,64)
+            sam_source = self.scaling_sam_source(sam_source) + self.positional_embed #(batch,embed_dim,64,64)
             sam_attention = self.go_forward((sam_source,sam_source),"sam")
             x = pl_source
-            for layer in self.layers:
-                x = self.go_forward((x,x),"pl")
-                x = layer(x,sam_attention)
+            for layer,attention in zip(self.layers,self.pl_attention):
+                x = attention(x,x) # self attention
+                x = layer(x,sam_attention) # cross attention
         
         return x
 
 class ConvolutionalCrossAttention(nn.Module):
-    def __init__(self,image_size:int,drop_rate=0.1):
+    def __init__(self,embed_dim=762,drop_rate=0.1):
         super().__init__()
 
-        self.image_size = image_size
+        self.embed_dim = embed_dim
 
-        self.W_query = nn.Sequential(
-            nn.Conv2d(in_channels=19,out_channels=3,kernel_size=3,stride=1,padding=1),
-            nn.Conv2d(in_channels=3,out_channels=9,kernel_size=3,stride=1,padding=1),
-            nn.Conv2d(in_channels=9,out_channels=19,kernel_size=3,stride=1,padding=1)
-        )
+        self.W_query = nn.Linear(embed_dim,embed_dim,bias=False)
 
-        self.W_key = nn.Sequential(
-            nn.Conv2d(in_channels=19,out_channels=3,kernel_size=3,stride=1,padding=1),
-            nn.Conv2d(in_channels=3,out_channels=9,kernel_size=3,stride=1,padding=1),
-            nn.Conv2d(in_channels=9,out_channels=19,kernel_size=3,stride=1,padding=1)
-        )
+        self.W_key = nn.Linear(embed_dim,embed_dim,bias=False)
 
-        self.W_value = nn.Sequential(
-            nn.Conv2d(in_channels=19,out_channels=3,kernel_size=3,stride=1,padding=1),
-            nn.Conv2d(in_channels=3,out_channels=9,kernel_size=3,stride=1,padding=1),
-            nn.Conv2d(in_channels=9,out_channels=19,kernel_size=3,stride=1,padding=1)
-        )
+        self.W_value = nn.Linear(embed_dim,embed_dim,bias=False)
 
-        self.sam_norm = nn.LayerNorm((image_size,image_size))
-        self.pl_norm = nn.LayerNorm((image_size,image_size))
+        self.sam_norm = nn.LayerNorm(embed_dim)
+        self.pl_norm = nn.LayerNorm(embed_dim)
 
         self.dropout = nn.Dropout(drop_rate)
 
         self.ff = nn.Sequential(
-            nn.Linear(image_size,image_size*2,bias=False),nn.Linear(2*image_size,image_size,bias=False)
+            nn.Linear(embed_dim,embed_dim*2,bias=False),
+            nn.ReLU(),
+            nn.Linear(2*embed_dim,embed_dim,bias=False)
         )
         self.ff_dropout =  nn.Dropout(drop_rate)
-        self.ff_layer_norm = nn.LayerNorm((image_size,image_size))
+        self.ff_layer_norm = nn.LayerNorm(embed_dim)
     
-    def compute_att(self,query:torch.Tensor,key:torch.Tensor,value:torch.Tensor):
-        batch_size = query.size(0)
-        channels = query.size(1)
-
-        query = query.view(batch_size,channels,-1).contiguous() # batch,channels,1024**2
-        key = key.view(batch_size,channels,-1).contiguous() # batch,channels,1024**2
-        value = value.view(batch_size,channels,-1).contiguous() # batch,channels,1024**2
-
-        attention_scores:torch.Tensor = (query @ key.transpose(-2,-1).contiguous()) / query.shape[-1]**0.5 # batch,channels,channels
+    def compute_att(self,query,key,value):
+        
+        attention_scores:torch.Tensor = (query @ key.transpose(-2,-1)) / query.shape[-1]**0.5
         attention_weights = attention_scores.contiguous().softmax(dim=-1)
         attention_weights = self.dropout(attention_weights)
 
-        attention = attention_weights @ value # batch,1024,channels,1024
-        return attention.view(batch_size,channels,self.image_size,self.image_size).contiguous()
+        attention = attention_weights @ value
+        return attention
     
     def forward(self,
                 pl_source:torch.Tensor,
                 sam_source:torch.Tensor
                 ):
+        batch,emed_dim,_,_ = pl_source.shape
+        pl_source = pl_source.flatten(start_dim=2)
+        sam_source = sam_source.flatten(start_dim=2)
+        # reshaping to (batch,64*64,embed_dim)
+        pl_source = pl_source.transpose(1,2).contiguous()
+        sam_source = sam_source.transpose(1,2).contiguous()
         
         sam_source = self.sam_norm(sam_source)
         pl_source = self.pl_norm(pl_source)
@@ -971,5 +1018,7 @@ class ConvolutionalCrossAttention(nn.Module):
         attention = self.ff_layer_norm(pl_source+attention)
         out = self.ff(attention)
         out = self.ff_dropout(out+attention)
+
+        out = out.transpose(1,2).view(batch,emed_dim,64,64).contiguous()
 
         return out

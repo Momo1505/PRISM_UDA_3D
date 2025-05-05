@@ -171,7 +171,7 @@ class CustomDataset(Dataset):
                     seg_map = img.replace(img_suffix, seg_map_suffix)
                     img_info['ann'] = dict(seg_map=seg_map)
                 if pseudo_label_dir is not None:  # <--- Added
-                    pseudo_label = img.replace(img_suffix, pseudo_label_suffix).split("/")[-1]  # <--- Added
+                    pseudo_label = img.replace(".png", pseudo_label_suffix).split("/")[-1]  # <--- Added
                     img_info['pseudo_label'] = pseudo_label  # <--- Added
                 img_infos.append(img_info)
 
