@@ -469,7 +469,7 @@ class SpatialAttentionModule(nn.Module):
 class HDRTransformer_backbone(nn.Module):
 
     def __init__(self, img_size=256, patch_size=16, in_chans=64,
-                 embed_dim=60, depths=[6], num_heads=[6],
+                 embed_dim=60, depths=[3], num_heads=[6],
                  window_size=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
@@ -595,23 +595,17 @@ class Block(nn.Module):
 
 def Conv():
     return nn.Sequential(
-            nn.Conv2d(1,10,kernel_size=3,stride=2,padding=1),
+            nn.Conv2d(1,10,kernel_size=3,padding=1),
             nn.GELU(),
-            nn.Conv2d(10,30,kernel_size=3,stride=2,padding=1),
+            nn.Conv2d(10,30,kernel_size=3,padding=1),
             nn.GELU(),
-            nn.Conv2d(30,60,kernel_size=1),
+            nn.Conv2d(30,60,kernel_size=3,padding=1),
         )
 def up_conv():
     return nn.Sequential(
             nn.Conv2d(60, 30, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-
-            nn.Conv2d(30, 20, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),  
-
-            nn.Conv2d(20, 19, kernel_size=1),
+            nn.Conv2d(30, 19, kernel_size=3,padding=1),
         )
 class MGDNRefinement(nn.Module):
     def __init__(self,num_blocks=5):
