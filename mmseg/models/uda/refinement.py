@@ -152,12 +152,20 @@ class DecoderLinear(nn.Module):
         self.n_cls = n_cls
         self.num_token = math.floor((img_size + 2 * (patch_size // 2) - patch_size) / stride) + 1
 
-        self.head = nn.Linear(self.d_encoder, n_cls)
+        self.head = nn.Sequential(
+            nn.Upsample(scale_factor=2,mode="bilinear",align_corners=False),
+            nn.Conv2d(in_channels=d_encoder,out_channels=d_encoder//2,kernel_size=3,padding=1),
+            nn.LeakyReLU(),
+            nn.Upsample(scale_factor=4,mode="bilinear",align_corners=False),
+            nn.Conv2d(in_channels=d_encoder//2,out_channels=d_encoder//4,kernel_size=3,padding=1),
+            nn.LeakyReLU(),
+            nn.Conv2d(in_channels=d_encoder//4,out_channels=n_cls,kernel_size=3,padding=1)
+        )
         self.img_size = img_size
 
     def forward(self, x):
-        x = self.head(x)
         x = rearrange(x, "b (h w) c -> b c h w", h=self.num_token)
+        x = self.head(x)
 
         return nn.functional.interpolate(x, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
 
@@ -176,7 +184,11 @@ class EncodeDecode(nn.Module):
             nn.GELU(),
             nn.Conv2d(in_channels=embed_dim//2,out_channels=embed_dim,kernel_size=1)
         )
-        self.decode = DecoderLinear(n_cls=19,patch_size=patch_size,d_encoder=embed_dim,img_size=img_size,stride=stride)
+        self.decode = DecoderLinear(n_cls=2,patch_size=patch_size,d_encoder=embed_dim,img_size=img_size,stride=stride)
+
+        self.sam_skip = nn.Conv2d(1,2,kernel_size=3,padding=1)
+        self.pl_skip = nn.Conv2d(1,2,kernel_size=3,padding=1)
+
 
         self.num_token = self.decode.num_token
 
@@ -192,4 +204,4 @@ class EncodeDecode(nn.Module):
         x = torch.cat([sam_latent,pl_source_latent],dim=1) 
         x = self.fuse(x)
         x = rearrange(x, "b c h w -> b (h w) c", h=self.num_token)
-        return self.decode(x) * (sam + pl_source)
+        return self.decode(x) * (self.sam_skip(sam) + self.pl_skip(pl_source))

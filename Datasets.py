@@ -132,3 +132,48 @@ class DistributionDataset(Dataset):
     def __getitem__(self, index):
         gt_image  = self.open_image(self.labels[index])
         return gt_image
+    
+class WeihToI3(Dataset):
+    def __init__(self,data_root="data/I3/",mode="train",mask_type="colour"):
+        super().__init__()
+        self.pl_paths = glob.glob(os.path.join(data_root,"pl_preds","*.png"),recursive=True)
+        train_size = int(len(self.pl_paths)*0.7)
+        if mode == "train":
+            self.pl_paths = self.pl_paths[:train_size]
+            self.sam_paths = list(map(self.transform_to_sam,self.pl_paths))
+            self.val_paths = list(map(self.transform_to_label,self.pl_paths))
+        else:
+            self.pl_paths = self.pl_paths[train_size:]
+            self.sam_paths = list(map(self.transform_to_sam,self.pl_paths))
+            self.val_paths = list(map(self.transform_to_label,self.pl_paths))
+
+
+        self.transform = transforms.Resize((256,256))
+
+    def __len__(self):
+        return len(self.pl_paths)
+
+    def transform_to_label(self,path:str):
+        path = path.replace("pl_preds","labels")
+        label_path = path.replace(".png","_labelTrainIds.png")
+        return label_path
+    
+    def transform_to_sam(self,path:str):
+        path = path.replace("pl_preds","sam")
+        label_path = path.replace(".png","_pseudoTrainIds.png")
+        return label_path
+
+    def open_image(self, path):
+        img = Image.open(path).convert("P")
+        img = self.transform(img)
+
+        img = np.array(img)
+        img.setflags(write=True)
+
+        return tensor(img).unsqueeze(0)
+
+    def __getitem__(self, index):
+        pl_image = self.open_image(self.pl_paths[index])
+        sam_image = self.open_image(self.sam_paths[index])
+        gt_image  = self.open_image(self.val_paths[index])
+        return pl_image, sam_image, gt_image
