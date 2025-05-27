@@ -231,7 +231,7 @@ if __name__ == '__main__':
         in_channel = 2 if dataset_type == "cityscapes" else 1
         model = UNet(in_channel=in_channel,n_classes=19,dataset_type=dataset_type)
     elif model_name == "MGDN":
-        model = MGDNRefinement(5)
+        model = MGDNRefinement()
     
 
     print(f"training {model_name} on {dataset_type} mask type {mask_type}, len du training is {len(train_ds)}")

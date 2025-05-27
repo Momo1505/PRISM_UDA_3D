@@ -7,6 +7,7 @@ from PIL import Image
 from torch import tensor
 from torch.utils.data import Dataset
 from torchvision import transforms
+import torch
 
 
 def transform_image_path(image_path:str,is_val=False,mask_type="colour"):
@@ -58,7 +59,7 @@ class GTADataset(Dataset):
         self.transform_to_sam = partial(self.transform_to_label,mode="val",mask_type=mask_type)
         if mode == "train":
             sam_mode = "sam_colour" if mask_type == "colour" else "sam"
-            self.sam_paths = glob.glob(os.path.join(train_data_root,sam_mode,"*_pseudoTrainIds.png"),recursive=True)
+            self.sam_paths = glob.glob(os.path.join(train_data_root,sam_mode,"*_pseudoTrainIds.png"),recursive=True)[:2500]
             self.labels = list(map(partial(self.transform_to_label,mask_type=mask_type),self.sam_paths))
 
         elif mode == "val":
@@ -94,3 +95,40 @@ class GTADataset(Dataset):
         sam_image = self.open_image(self.sam_paths[index])
         gt_image  = self.open_image(self.labels[index])
         return sam_image, gt_image
+
+class DistributionDataset(Dataset):
+    def __init__(self,labels_list,train_data_root="data/gta/"):
+        super().__init__()
+        self.labels = labels_list
+
+        self.transform = transforms.Resize((256,256))
+
+    def __len__(self):
+        return len(self.labels)
+
+    def open_image(self, path):
+        img = Image.open(path).convert("P")
+        img = self.transform(img)
+
+        img = np.array(img)
+        img.setflags(write=True)
+
+        img = torch.tensor(img).unsqueeze(0)
+
+        targets = torch.arange(19)
+        masks = []
+        true_targets = []
+        for cls in targets:
+            mask = (img == cls).float()
+            if mask.sum() == 0:
+                continue
+            mask = mask * 255
+            masks.append(mask)
+            true_targets.append(cls)
+        masks = torch.stack(masks)
+        true_targets = torch.stack(true_targets)
+
+        return masks,true_targets
+    def __getitem__(self, index):
+        gt_image  = self.open_image(self.labels[index])
+        return gt_image

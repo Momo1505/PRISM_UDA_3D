@@ -10,7 +10,7 @@
 #SBATCH --constraint="gpua100"
 #SBATCH --mail-user="mouhamed.sow@unistra.fr"
 #SBATCH --mail-type=BEGIN,END,FAIL
-#SBATCH -o jobs/test_i3toweih_res.out 
+#SBATCH -o jobs/test_weihtoi3_transformer_res.out
 
 # +------------------------------------------------------------------------------------+ #
 # |                                ENVIRONNEMENT SET UP                                | #
@@ -43,7 +43,7 @@ echo 'START'
 
 export CUDA_LAUNCH_BLOCKING=1
 
-TEST_ROOT=work_dirs/local-basic/250519_1714_i3toweih_c50b4
+TEST_ROOT=work_dirs/local-basic/250515_1549_weihtoi3_ac37e
 CONFIG_FILE="${TEST_ROOT}/*${TEST_ROOT: -1}.py"
 CHECKPOINT_FILE="${TEST_ROOT}/latest.pth"
 SHOW_DIR="${TEST_ROOT}/preds"
@@ -52,5 +52,5 @@ echo 'Config File:' $CONFIG_FILE
 echo 'Checkpoint File:' $CHECKPOINT_FILE
 echo 'Predictions Output Directory:' $SHOW_DIR
 python -m tools.test ${CONFIG_FILE} ${CHECKPOINT_FILE} --eval mIoU --show-dir ${SHOW_DIR} --opacity 1
-python get_results.py --pred_path $SHOW_DIR --gt_path ./data/WeiH/labels/
+python get_results.py --pred_path $SHOW_DIR --gt_path ./data/I3/labels/
 echo 'END'

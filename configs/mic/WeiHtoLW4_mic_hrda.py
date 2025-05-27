@@ -82,7 +82,7 @@ uda = dict(
     # Use random patch masking with a patch size of 64x64
     # and a mask ratio of 0.7
     mask_generator=dict(
-        type='block', mask_ratio=0.7, mask_block_size=64, _delete_=True))
+        type='block', mask_ratio=0.7, mask_block_size=64, _delete_=True),source="WeiH")
 # Optimizer Hyperparameters
 optimizer_config = None
 optimizer = dict(
@@ -94,7 +94,7 @@ optimizer = dict(
             norm=dict(decay_mult=0.0))))
 n_gpus = 1
 gpu_model = 'NVIDIATITANRTX'
-runner = dict(type='IterBasedRunner', max_iters=40000)
+runner = dict(type='IterBasedRunner', max_iters=30000)
 # Logging Configuration
 checkpoint_config = dict(by_epoch=False, interval=5000, max_keep_ckpts=3)
 evaluation = dict(interval=4000, metric='mIoU')

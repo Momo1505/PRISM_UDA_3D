@@ -468,8 +468,8 @@ class SpatialAttentionModule(nn.Module):
 
 class HDRTransformer_backbone(nn.Module):
 
-    def __init__(self, img_size=256, patch_size=16, in_chans=64,
-                 embed_dim=60, depths=[3], num_heads=[6],
+    def __init__(self, img_size=256, patch_size=16, in_chans=20,
+                 embed_dim=12, depths=[3], num_heads=[6],
                  window_size=8, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
@@ -595,17 +595,17 @@ class Block(nn.Module):
 
 def Conv():
     return nn.Sequential(
-            nn.Conv2d(1,10,kernel_size=3,padding=1),
+            nn.Conv2d(1,5,kernel_size=3,padding=1),
             nn.GELU(),
-            nn.Conv2d(10,30,kernel_size=3,padding=1),
+            nn.Conv2d(5,10,kernel_size=3,padding=1),
             nn.GELU(),
-            nn.Conv2d(30,60,kernel_size=3,padding=1),
+            nn.Conv2d(10,12,kernel_size=3,padding=1),
         )
 def up_conv():
     return nn.Sequential(
-            nn.Conv2d(60, 30, kernel_size=3, padding=1),
+            nn.Conv2d(12, 10, kernel_size=3, padding=1),
             nn.GELU(),
-            nn.Conv2d(30, 19, kernel_size=3,padding=1),
+            nn.Conv2d(10, 19, kernel_size=3,padding=1),
         )
 class MGDNRefinement(nn.Module):
     def __init__(self,num_blocks=5):
@@ -613,7 +613,7 @@ class MGDNRefinement(nn.Module):
         self.sam_feature = Conv()
         self.pl_feature = Conv()
         self.layers = nn.ModuleList([
-            Block(in_channels=60) for _ in range(num_blocks)
+            Block(in_channels=12) for _ in range(num_blocks)
         ])
         self.classification = up_conv()
     def forward(self,sam_source,pl_source):
@@ -624,7 +624,7 @@ class MGDNRefinement(nn.Module):
             decode = layer((sam_feature,pl_feature))
             sam_feature = sam_feature + decode
             pl_feature = pl_feature + decode
-        return self.classification(decode)
+        return self.classification(decode) * (sam_source + pl_source)
 
 
 

@@ -46,19 +46,23 @@ for CONFIG_FILE in $CONFIG_DIR/*.py; do
     # Create the SLURM script
     cat <<EOL > $SLURM_SCRIPT
 #! /bin/bash
-#SBATCH -p publicgpu -A miv
+#SBATCH -p grantgpu -A g2024a219g
 #SBATCH -N 1
 #SBATCH -n 1
 #SBATCH -c 1
 #SBATCH --gres=gpu:1
 #SBATCH --mem=16G
-#SBATCH --constraint="gpuv100|gpua40|gpua100"
+#SBATCH --constraint="gpua100"
+#SBATCH --mail-user="mouhamed.sow@unistra.fr"
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH -o jobs/${JOB_NAME}.out
 hostname
-source deactivate
 module load python/python-3.8.18
-source ~/venv/hrda/bin/activate
+module load cuda/cuda-11.2
+source ~/venv/prism-uda/bin/activate
 python --version
+
+cd ~/domain_adaptation
 echo 'START'
 
 TEST_ROOT=$LATEST_DIR
@@ -69,9 +73,8 @@ echo 'Config File:' \$CONFIG_FILE
 echo 'Checkpoint File:' \$CHECKPOINT_FILE
 echo 'Predictions Output Directory:' \$SHOW_DIR
 python -m tools.test \${CONFIG_FILE} \${CHECKPOINT_FILE} --eval mIoU --show-dir \${SHOW_DIR} --opacity 1
-deactivate
-load-python
-python get_results.py --pred_path \$SHOW_DIR --gt_path /home2020/home/miv/astenger/data/segdiff/${TARGET}/test/lbl/labels/
+
+python get_results.py --pred_path \$SHOW_DIR --gt_path ./data/${TARGET}/labels/
 EOL
 
     # Add this script to the launch script
@@ -82,20 +85,27 @@ EOL
 
 cat <<EOL > $SLURM_SCRIPT_RES
 #! /bin/bash
-#SBATCH -p public -A miv
+#SBATCH -p grantgpu -A g2024a219g
 #SBATCH -N 1
 #SBATCH --mem=16G
+#SBATCH --constraint="gpua100"
+#SBATCH --mail-user="mouhamed.sow@unistra.fr"
+#SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH -o jobs/${JOB_NAME}_res.out
 hostname
-source deactivate
+module load python/python-3.8.18
+module load cuda/cuda-11.2
+source ~/venv/prism-uda/bin/activate
+python --version
+
+cd ~/domain_adaptation
 echo 'START'
 
 TEST_ROOT=$LATEST_DIR
 CONFIG_FILE="\${TEST_ROOT}/*\${TEST_ROOT: -1}.py"
 CHECKPOINT_FILE="\${TEST_ROOT}/latest.pth"
 SHOW_DIR="\${TEST_ROOT}/preds"
-module load python/python-3.11.4 && activate deep-learning
-python get_results.py --pred_path \$SHOW_DIR --gt_path /home2020/home/miv/astenger/data/segdiff/${TARGET}/test/lbl/labels/
+python get_results.py --pred_path \$SHOW_DIR --gt_path ./data/${TARGET}/labels/
 EOL
 
     # Add this script to the launch script
