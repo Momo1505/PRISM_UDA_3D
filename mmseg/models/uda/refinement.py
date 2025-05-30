@@ -198,10 +198,10 @@ class EncodeDecode(nn.Module):
 
         sam = F.interpolate(sam.float(),size=(256,256),mode='bilinear', align_corners=False)
         pl_source = F.interpolate(pl_source.float(),size=(256,256),mode='bilinear', align_corners=False)
-        sam_latent,pl_source_latent = self.encode(sam,pl_source)
+        sam_latent,pl_source_latent = self.encode(sam,pl_source + sam) # adding sam and pl as pl
         sam_latent = rearrange(sam_latent, "b (h w) c -> b c h w", h=self.num_token)
         pl_source_latent = rearrange(pl_source_latent, "b (h w) c -> b c h w", h=self.num_token)
         x = torch.cat([sam_latent,pl_source_latent],dim=1) 
         x = self.fuse(x)
         x = rearrange(x, "b c h w -> b (h w) c", h=self.num_token)
-        return self.decode(x) * (self.sam_skip(sam) + self.pl_skip(pl_source))
+        return self.decode(x) * (self.sam_skip(sam) + self.pl_skip(pl_source+sam))
