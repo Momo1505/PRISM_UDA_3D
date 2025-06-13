@@ -47,6 +47,7 @@ from mmseg.models.uda.refinement import EncodeDecode
 from mmseg.models.uda.swinir_backbone import MGDNRefinement
 from torch.cuda.amp.grad_scaler import GradScaler
 import json
+# from model import build_transformer
 #from mmseg.models.uda.refinement import EncodeDecode
 
 

@@ -1,334 +1,428 @@
-import math
+# Obtained from: https://github.com/open-mmlab/mmsegmentation/tree/v0.16.0
+# Modifications: Save label with train_id color map if opacity==1
+
+import os
+import warnings
+from abc import ABCMeta, abstractmethod
+from collections import OrderedDict
+
+import mmcv
+import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-from timm.models.layers import to_2tuple
+import torch.nn.functional as F
+from mmcv import mkdir_or_exist
+from mmcv.runner import BaseModule, auto_fp16
+from PIL import Image
+from mmseg.models.uda.refinement import EncodeDecode
 from einops import rearrange
 
-class PatchEmbed(nn.Module):
-    """Image to Patch Embedding."""
+class BaseSegmentor(BaseModule, metaclass=ABCMeta):
+    """Base class for segmentors."""
 
-    def __init__(self,
-                 img_size=256,
-                 patch_size=8,
-                 stride=8,
-                 in_chans=1,
-                 embed_dim=256):
-        super().__init__()
-        img_size = to_2tuple(img_size)
-        patch_size = to_2tuple(patch_size)
+    def __init__(self, init_cfg=None):
+        super(BaseSegmentor, self).__init__(init_cfg)
+        self.fp16_enabled = False
 
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.H, self.W = img_size[0] // patch_size[0], img_size[
-            1] // patch_size[1]
-        self.num_patches = self.H * self.W
-        self.proj = nn.Conv2d(
-            in_chans,
-            embed_dim,
-            kernel_size=patch_size,
-            stride=stride,
-            padding=(patch_size[0] // 2, patch_size[1] // 2))
-        self.norm = nn.LayerNorm(embed_dim)
-        token = math.floor((img_size[0] + 2 * (patch_size[0] // 2) - patch_size[0]) / stride) + 1
-        self.num_tokens= token ** 2
+    @property
+    def with_neck(self):
+        """bool: whether the segmentor has neck"""
+        return hasattr(self, 'neck') and self.neck is not None
 
-    def forward(self, x):
-        x = self.proj(x)
-        _, _, H, W = x.shape
-        x = x.flatten(2).transpose(1, 2).contiguous()
-        x = self.norm(x)
+    @property
+    def with_auxiliary_head(self):
+        """bool: whether the segmentor has auxiliary head"""
+        return hasattr(self,
+                       'auxiliary_head') and self.auxiliary_head is not None
 
-        return x
+    @property
+    def with_decode_head(self):
+        """bool: whether the segmentor has decode head"""
+        return hasattr(self, 'decode_head') and self.decode_head is not None
 
+    @abstractmethod
+    def extract_feat(self, imgs):
+        """Placeholder for extract features from images."""
+        pass
 
-class PositionalEncoding(nn.Module):
-    def __init__(self,d_model : int,seq_len : int,dropout : float):
-        super(PositionalEncoding, self).__init__()
-        self.d_model = d_model
-        self.seq_len = seq_len
-        self.dropout = nn.Dropout(dropout)
+    @abstractmethod
+    def encode_decode(self, img, img_metas, upscale_pred=True):
+        """Placeholder for encode images with backbone and decode into a
+        semantic segmentation map of the same size as input."""
+        pass
 
-        #create the positional_encoding matrix of shape (seq_len,d_model)
-        pe = torch.zeros(seq_len,d_model,dtype=torch.float)
-        #compute the numerator of shape (seq_len,1)
-        numerator = torch.arange(seq_len,dtype=torch.float).unsqueeze(1)
-        #create the denominator
-        denominator = torch.exp(torch.arange(0,d_model,2).float() * (- math.log(10000.0) / d_model))
-        #apply the sin to even positions
-        pe[:,0::2] = torch.sin(numerator*denominator)
-        #apply the cos to the odd position
-        pe[:,1::2] = torch.cos(numerator*denominator)
+    @abstractmethod
+    def forward_train(self, imgs, img_metas, **kwargs):
+        """Placeholder for Forward function for training."""
+        pass
 
-        pe = pe.unsqueeze(0) # shape (1,seq_len,d_model)
-        self.register_buffer("pe",pe)
+    @abstractmethod
+    def simple_test(self, img, img_meta, **kwargs):
+        """Placeholder for single image test."""
+        pass
 
-    def forward(self,x):
-        x = x + (self.pe[:,:x.size(1),:]).requires_grad_(False)
-        return self.dropout(x)
+    @abstractmethod
+    def aug_test(self, imgs, img_metas, **kwargs):
+        """Placeholder for augmentation test."""
+        pass
 
-class LayerNormalization(nn.Module):
-    def __init__(self,eps:float = 1e-6):
-        super(LayerNormalization, self).__init__()
-        self.eps = eps
-        self.gamma = nn.Parameter(torch.ones(1)) # multiplied
-        self.beta = nn.Parameter(torch.zeros(1)) # added
+    def forward_test(self, imgs, img_metas, **kwargs):
+        """
+        Args:
+            imgs (List[Tensor]): the outer list indicates test-time
+                augmentations and inner Tensor should have a shape NxCxHxW,
+                which contains all images in the batch.
+            img_metas (List[List[dict]]): the outer list indicates test-time
+                augs (multiscale, flip, etc.) and the inner list indicates
+                images in a batch.
+        """
+        for var, name in [(imgs, 'imgs'), (img_metas, 'img_metas')]:
+            if not isinstance(var, list):
+                raise TypeError(f'{name} must be a list, but got '
+                                f'{type(var)}')
 
-    def forward(self, x):
-        means = x.mean(dim=-1, keepdim=True)
-        std = x.std(dim=-1, keepdim=True)
-        return ((x - means) * self.gamma) / (std + self.eps) + self.beta
+        num_augs = len(imgs)
+        if num_augs != len(img_metas):
+            raise ValueError(f'num of augmentations ({len(imgs)}) != '
+                             f'num of image meta ({len(img_metas)})')
+        # all images in the same aug batch all of the same ori_shape and pad
+        # shape
+        for img_meta in img_metas:
+            ori_shapes = [_['ori_shape'] for _ in img_meta]
+            assert all(shape == ori_shapes[0] for shape in ori_shapes)
+            img_shapes = [_['img_shape'] for _ in img_meta]
+            assert all(shape == img_shapes[0] for shape in img_shapes)
+            pad_shapes = [_['pad_shape'] for _ in img_meta]
+            assert all(shape == pad_shapes[0] for shape in pad_shapes)
 
-class FeedForwardBlock(nn.Module):
-    def __init__(self, d_model:int, dff:int, dropout:float):
-        super(FeedForwardBlock, self).__init__()
-        self.feed_forward = nn.Sequential(
-            nn.Linear(d_model,dff),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dff,d_model)
-        )
+        if num_augs == 1:
+            return self.simple_test(imgs[0], img_metas[0], **kwargs)
+        else:
+            return self.aug_test(imgs, img_metas, **kwargs)
 
-    def forward(self,x):
-        # (batch,seq_len,d_model) --> (batch,seq_len,dff) --> (batch,seq_len,d_model)
-        return self.feed_forward(x)
+    @auto_fp16(apply_to=('img', ))
+    def forward(self, img, img_metas, return_loss=True, **kwargs):
+        """Calls either :func:`forward_train` or :func:`forward_test` depending
+        on whether ``return_loss`` is ``True``.
 
-class MultiHeadAttentionBlock(nn.Module):
-    def __init__(self,d_model:int, h:int, dropout:float):
-        super(MultiHeadAttentionBlock,self).__init__()
-        self.d_model = d_model
-        self.h = h
-        assert d_model % h == 0, "d_model is not divisible by h"
+        Note this setting will change the expected inputs. When
+        ``return_loss=True``, img and img_meta are single-nested (i.e. Tensor
+        and List[dict]), and when ``resturn_loss=False``, img and img_meta
+        should be double nested (i.e.  List[Tensor], List[List[dict]]), with
+        the outer list indicating test time augmentations.
+        """
+        print("into forward function", kwargs.keys())
+        if return_loss:
+            return self.forward_train(img, img_metas, **kwargs)
+        else:
+            return self.forward_test(img, img_metas, **kwargs)
 
-        self.d_k = d_model // h
+    def train_step(self, data_batch, optimizer, **kwargs):
+        """The iteration step during training.
 
-        self.w_q = nn.Linear(d_model,d_model)
-        self.w_k = nn.Linear(d_model,d_model)
-        self.w_v = nn.Linear(d_model,d_model)
+        This method defines an iteration step during training, except for the
+        back propagation and optimizer updating, which are done in an optimizer
+        hook. Note that in some complicated cases or models, the whole process
+        including back propagation and optimizer updating is also defined in
+        this method, such as GAN.
 
-        self.w_o = nn.Linear(d_model,d_model)
-        self.dropout = nn.Dropout(dropout)
+        Args:
+            data (dict): The output of dataloader.
+            optimizer (:obj:`torch.optim.Optimizer` | dict): The optimizer of
+                runner is passed to ``train_step()``. This argument is unused
+                and reserved.
+
+        Returns:
+            dict: It should contain at least 3 keys: ``loss``, ``log_vars``,
+                ``num_samples``.
+                ``loss`` is a tensor for back propagation, which can be a
+                weighted sum of multiple losses.
+                ``log_vars`` contains all the variables to be sent to the
+                logger.
+                ``num_samples`` indicates the batch size (when the model is
+                DDP, it means the batch size on each GPU), which is used for
+                averaging the logs.
+        """
+        losses = self(**data_batch)
+        loss, log_vars = self._parse_losses(losses)
+
+        outputs = dict(
+            loss=loss,
+            log_vars=log_vars,
+            num_samples=len(data_batch['img_metas']))
+
+        return outputs
+
+    def val_step(self, data_batch, **kwargs):
+        """The iteration step during validation.
+
+        This method shares the same signature as :func:`train_step`, but used
+        during val epochs. Note that the evaluation after training epochs is
+        not implemented with this method, but an evaluation hook.
+        """
+        output = self(**data_batch, **kwargs)
+        return output
+
     @staticmethod
-    def attention(query,key,value,mask,dropout: nn.Dropout):
-        d_k = query.shape[-1]
+    def _parse_losses(losses):
+        """Parse the raw outputs (losses) of the network.
 
-        # (batch,h,seq_len,d_k) --> (batch,h,seq_len,seq_len)
-        attention_scores = (query @ key.transpose(-2,-1)) / math.sqrt(d_k)
+        Args:
+            losses (dict): Raw output of the network, which usually contain
+                losses and other necessary information.
 
-        if mask is not None:
-            attention_scores.masked_fill_(mask == 0, 1e-9)
+        Returns:
+            tuple[Tensor, dict]: (loss, log_vars), loss is the loss tensor
+                which may be a weighted sum of all losses, log_vars contains
+                all the variables to be sent to the logger.
+        """
+        log_vars = OrderedDict()
+        for loss_name, loss_value in losses.items():
+            if isinstance(loss_value, torch.Tensor):
+                log_vars[loss_name] = loss_value.mean()
+            elif isinstance(loss_value, list):
+                log_vars[loss_name] = sum(_loss.mean() for _loss in loss_value)
+            else:
+                raise TypeError(
+                    f'{loss_name} is not a tensor or list of tensors')
 
-        attention_scores = attention_scores.softmax(dim=-1) # (batch,h,seq_len,seq_len)
+        loss = sum(_value for _key, _value in log_vars.items()
+                   if 'loss' in _key)
 
-        if dropout is not None:
-            attention_scores = dropout(attention_scores)
+        log_vars['loss'] = loss
+        for loss_name, loss_value in log_vars.items():
+            # reduce loss when distributed training
+            if dist.is_available() and dist.is_initialized():
+                loss_value = loss_value.data.clone()
+                dist.all_reduce(loss_value.div_(dist.get_world_size()))
+            log_vars[loss_name] = loss_value.item()
 
-        return (attention_scores @ value), attention_scores
+        return loss, log_vars
 
-    def forward(self,q,k,v,mask):
-        query = self.w_q(q) # (batch,seq_len,d_model) --> (batch,seq_len,d_model)
-        key = self.w_k(k) # (batch,seq_len,d_model) --> (batch,seq_len,d_model)
-        value = self.w_v(v) # (batch,seq_len,d_model) --> (batch,seq_len,d_model)
+    def show_result(self,
+                    img,
+                    result,
+                    palette=None,
+                    win_name='',
+                    show=False,
+                    wait_time=0,
+                    out_file=None,
+                    opacity=0.5):
+        """Draw `result` over `img`.
 
-        # (batch,seq_len,d_model) --> (batch,seq_len,h,d_k) -> (batch,h,seq_len,d_k)
-        query = query.view(query.shape[0],query.shape[1],self.h,self.d_k).transpose(1,2)
-        key = key.view(key.shape[0],value.shape[1],self.h,self.d_k).transpose(1,2)
-        value = value.view(value.shape[0],value.shape[1],self.h,self.d_k).transpose(1,2)
+        Args:
+            img (str or Tensor): The image to be displayed.
+            result (Tensor): The semantic segmentation results to draw over
+                `img`.
+            palette (list[list[int]]] | np.ndarray | None): The palette of
+                segmentation map. If None is given, random palette will be
+                generated. Default: None
+            win_name (str): The window name.
+            wait_time (int): Value of waitKey param.
+                Default: 0.
+            show (bool): Whether to show the image.
+                Default: False.
+            out_file (str or None): The filename to write the image.
+                Default: None.
+            opacity(float): Opacity of painted segmentation map.
+                Default 0.5.
+                Must be in (0, 1] range.
+        Returns:
+            img (Tensor): Only if not `show` or `out_file`
+        """
+        img = mmcv.imread(img)
+        img = img.copy()
+        seg = result[0]
+        if palette is None:
+            if self.PALETTE is None:
+                palette = np.random.randint(
+                    0, 255, size=(len(self.CLASSES), 3))
+            else:
+                palette = self.PALETTE
+        palette = np.array(palette)
+        assert palette.shape[0] == len(self.CLASSES)
+        assert palette.shape[1] == 3
+        assert len(palette.shape) == 2
+        assert 0 < opacity <= 1.0
 
-        x, self.attention_scores = MultiHeadAttentionBlock.attention(query,key,value,mask,self.dropout)
+        # Save label with train_id color map
+        if out_file is not None and opacity == 1.0:
+            palette = np.array(self.PALETTE, dtype=np.uint8)
+            out = Image.fromarray(np.array(seg).astype(np.uint8)).convert('P')
+            out.putpalette(palette)
+            mkdir_or_exist(os.path.abspath(os.path.dirname(out_file)))
+            out.save(out_file)
+            return
 
-        # (batch,h,seq_len,d_k) --> (batch,seq_len,h,d_k) --> (batch,seq_len,d_model)
-        x = x.transpose(1,2).contiguous().view(x.shape[0],-1,self.h * self.d_k)
+        color_seg = np.zeros((seg.shape[0], seg.shape[1], 3), dtype=np.uint8)
+        for label, color in enumerate(palette):
+            color_seg[seg == label, :] = color
+        # convert to BGR
+        color_seg = color_seg[..., ::-1]
 
-        # (batch,seq_len,d_model) --> (batch,seq_len,d_model) 
-        return self.w_o(x)
+        img = img * (1 - opacity) + color_seg * opacity
+        img = img.astype(np.uint8)
+        # if out_file specified, do not show image in window
+        if out_file is not None:
+            show = False
 
+        if show:
+            mmcv.imshow(img, win_name, wait_time)
+        if out_file is not None:
+            mmcv.imwrite(img, out_file)
 
-class ResidualConnection(nn.Module):
-    def __init__(self, dropout:float):
-        super(ResidualConnection, self).__init__()
-        self.dropout = nn.Dropout(dropout)
-        self.norm = LayerNormalization()
+        if not (show or out_file):
+            warnings.warn('show==False and out_file is not specified, only '
+                          'result image will be returned')
+            return img
 
-    def forward(self,x,sublayer):
-        return x + self.dropout(sublayer(self.norm(x)))
+class DoubleConvPerso(nn.Module):
+    """(convolution => [BN] => ReLU) * 2"""
 
-class EncoderBlock(nn.Module):
-    def __init__(self, self_attention_block: MultiHeadAttentionBlock,
-                 feed_forward_block: FeedForwardBlock,
-                 dropout: float):
-        super(EncoderBlock,self).__init__()
-        self.self_attention_block = self_attention_block
-        self.feed_forward_block = feed_forward_block
-        self.residual_connections = nn.ModuleList([ResidualConnection(dropout) for _ in range(2)])
-
-    def forward(self,x,src_mask):
-        x = self.residual_connections[0](x, lambda x: self.self_attention_block(x, x, x, src_mask))
-        x = self.residual_connections[1](x,self.feed_forward_block)
-        return x
-
-class Encoder(nn.Module):
-    def __init__(self,layers : nn.ModuleList):
-        super(Encoder,self).__init__()
-        self.layers = layers
-        self.norm = LayerNormalization()
-
-    def forward(self,x,mask):
-        for encoder_block in self.layers:
-            x = encoder_block(x,mask)
-        return self.norm(x)
-
-class DecoderBlock(nn.Module):
-    def __init__(self,self_attention_block : MultiHeadAttentionBlock,
-                 cross_attention_block : MultiHeadAttentionBlock,
-                 feed_forward_block: FeedForwardBlock,
-                 dropout: float):
+    def __init__(self, in_channels, out_channels, norm_layer, mid_channels=None):
         super().__init__()
-        self.self_attention_block = self_attention_block
-        self.cross_attention_block = cross_attention_block
-        self.feed_forward_block = feed_forward_block
-        self.residual_connections = nn.ModuleList([ResidualConnection(dropout) for _ in range(3)])
-
-    def forward(self,x,encoder_output,src_mask,tgt_mask):
-        x = self.residual_connections[0](x,lambda x: self.self_attention_block(x, x, x, tgt_mask))
-        x = self.residual_connections[1](x,lambda x: self.cross_attention_block(x, encoder_output, encoder_output, src_mask))
-        x = self.residual_connections[2](x,self.feed_forward_block)
-        return x
-
-class Decoder(nn.Module):
-    def __init__(self,layers:nn.ModuleList):
-        super(Decoder,self).__init__()
-        self.layers = layers
-        self.norm = LayerNormalization()
-
-    def forward(self,x,encoder_output,src_mask,tgt_mask):
-        for decoder_block in self.layers:
-            x = decoder_block(x,encoder_output,src_mask,tgt_mask)
-
-        return self.norm(x)
-
-class ProjectionLayer(nn.Module):
-    def __init__(self,d_model:int, vocab_size:int):
-        super(ProjectionLayer,self).__init__()
-        self.projection = nn.Linear(d_model,vocab_size)
-
-    def forward(self,x):
-        # (batch,seq_len,d_model) --> # (batch,seq_len,vocab_size)
-        return torch.log_softmax(self.projection(x), dim=-1 )
-
-class ConvDecoder(nn.Module):
-    def __init__(self, n_cls=2, patch_size=8, d_encoder=256,img_size=256,stride=8):
-        super().__init__()
-
-        self.d_encoder = d_encoder
-        self.patch_size = patch_size
-        self.n_cls = n_cls
-        self.num_token = math.floor((img_size + 2 * (patch_size // 2) - patch_size) / stride) + 1
-
-        self.head = nn.Sequential(
-            nn.Upsample(scale_factor=2,mode="bilinear",align_corners=False),
-            nn.Conv2d(in_channels=d_encoder,out_channels=d_encoder//2,kernel_size=3,padding=1),
-            nn.LeakyReLU(),
-            nn.Upsample(scale_factor=4,mode="bilinear",align_corners=False),
-            nn.Conv2d(in_channels=d_encoder//2,out_channels=d_encoder//4,kernel_size=3,padding=1),
-            nn.LeakyReLU(),
-            nn.Upsample(scale_factor=2,mode="bilinear",align_corners=False),
-            nn.Conv2d(in_channels=d_encoder//4,out_channels=d_encoder//8,kernel_size=3,padding=1),
-            nn.LeakyReLU(),
-            nn.Conv2d(in_channels=d_encoder//8,out_channels=n_cls,kernel_size=3,padding=1)
+        
+        if not mid_channels:
+            mid_channels = out_channels
+            
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(mid_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
         )
-        self.img_size = img_size
+            
+        
+        if norm_layer == "bn" :
+            
+            self.double_conv = nn.Sequential(
+                nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(mid_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            )
+        
+        elif norm_layer == "in" :
+            
+            self.double_conv = nn.Sequential(
+                nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False),
+                nn.InstanceNorm2d(mid_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1, bias=False),
+                nn.InstanceNorm2d(out_channels),
+                nn.ReLU(inplace=True)
+            )
 
     def forward(self, x):
-        x = rearrange(x, "b (h w) c -> b c h w", h=self.num_token)
-        x = self.head(x)
+        return self.double_conv(x)
 
-        return nn.functional.interpolate(x, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
 
-class Transformer(nn.Module):
-    def __init__(self,encoder: Encoder,
-                 decoder: Decoder,
-                 input_embeddings: PatchEmbed,
-                 target_embeddings: PatchEmbed,
-                 input_position: PositionalEncoding,
-                 target_position: PositionalEncoding,
-                 projection: ProjectionLayer):
-        super(Transformer,self).__init__()
-        self.decoder = decoder
-        self.encoder = encoder
-        self.input_embeddings = input_embeddings
-        self.target_embeddings = target_embeddings
-        self.input_position = input_position
-        self.target_position = target_position
-        self.projection = projection
-        self.decoder_conv = ConvDecoder()
+class Down(nn.Module):
+    """Downscaling with maxpool then double conv"""
 
-    def encode(self,input, input_mask=None):
-        x = self.input_embeddings(input)
-        x = self.input_position(x)
-        return self.encoder(x,input_mask)
+    def __init__(self, in_channels, out_channels, norm_layer):
+        super().__init__()
+        self.maxpool_conv = nn.Sequential(
+            nn.MaxPool2d(2),
+            DoubleConvPerso(in_channels, out_channels, norm_layer)
+        )
 
-    def decode(self,encoder_output,src_mask,tgt,tgt_mask):
-        tgt = self.target_embeddings(tgt)
-        tgt = self.target_position(tgt)
-        return self.decoder(tgt,encoder_output,src_mask,tgt_mask)
+    def forward(self, x):
+        return self.maxpool_conv(x)
 
-    def project(self,x):
-        x = self.projection(x)
-        return self.decoder_conv(x)
+
+class Up(nn.Module):
+    """Upscaling then double conv"""
+
+    def __init__(self, in_channels, out_channels, norm_layer, bilinear=True, skip_connection=True):
+        super().__init__()
+        
+        self.skip_connection = skip_connection
+
+        # if bilinear, use the normal convolutions to reduce the number of channels
+        if bilinear:
+            self.up = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+            self.conv = DoubleConvPerso(in_channels, out_channels, in_channels // 2, norm_layer)
+        else:
+            self.up = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
+            self.conv = DoubleConvPerso(in_channels, out_channels, norm_layer)
+
+    def forward(self, x1, x2):
+        
+        if self.skip_connection :
+            x1 = self.up(x1)
+            # input is CHW
+            diffY = x2.size()[2] - x1.size()[2]
+            diffX = x2.size()[3] - x1.size()[3]
+
+            x1 = F.pad(x1, [diffX // 2, diffX - diffX // 2,
+                        diffY // 2, diffY - diffY // 2])
+            # if you have padding issues, see
+            # https://github.com/HaiyongJiang/U-Net-Pytorch-Unstructured-Buggy/commit/0e854509c2cea854e247a9c615f175f76fbb2e3a
+            # https://github.com/xiaopeng-liao/Pytorch-UNet/commit/8ebac70e633bac59fc22bb5195e513d5832fb3bd
+            x = torch.cat([x2, x1], dim=1)
+            return self.conv(x)
+        
+        else :
+            x1 = self.up(x1)
+            return self.conv(x1)
+
+
+class OutConv(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(OutConv, self).__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
+
+    def forward(self, x):
+        return self.conv(x)
+
     
-    def forward(self,sam,pl):
-        encode = self.encode(sam,None)
-        decode = self.decode(encode,None,pl,None)
-        return self.project(decode)
+class UNet(nn.Module):
+    def __init__(self, in_channel=2, n_classes=1, norm_layer="bn", bilinear=False):
+        super(UNet, self).__init__()
+        self.in_channel = in_channel
+        self.n_classes = n_classes
+        self.bilinear = bilinear
+        self.norm_layer = norm_layer
 
+        self.transformer_decoder = EncodeDecode("cpu",in_chans=2)
+        self.num_token = self.transformer_decoder.num_token
 
-def build_transformer(
-        src_vocab_size : int=256,
-        tgt_vocab_size : int=256,
-        d_model : int = 256,
-        N : int = 6, # number of block
-        h : int = 8,
-        dropout : float = 0.1,
-        dff : int = 512
-) -> Transformer:
-    # create the embedding layer
-    src_embedding = PatchEmbed()
-    tgt_embedding = PatchEmbed()
+        self.inc = DoubleConvPerso(in_channel, 64, norm_layer)
+        self.down1 = Down(64, 128, norm_layer)
+        self.down2 = Down(128, 256, norm_layer)
+        self.down3 = Down(256, 512, norm_layer)
+        factor = 2 if bilinear else 1
+        self.down4 = Down(512, 1024 // factor, norm_layer)
+        self.up1 = Up(1024, 512 // factor, norm_layer, bilinear)
+        self.up2 = Up(512, 256 // factor, norm_layer, bilinear)
+        self.up3 = Up(256, 128 // factor, norm_layer, bilinear)
+        self.up4 = Up(128, 64, norm_layer, bilinear)
+        self.outc = OutConv(64, n_classes)
 
-    # create the positional encoding
-    src_pos = PositionalEncoding(d_model,src_embedding.num_tokens,dropout)
-    tgt_pos = PositionalEncoding(d_model,tgt_embedding.num_tokens,dropout)
+    def forward(self, sam,pl):
+        sam = F.interpolate(sam.float(),size=(256,256),mode='bilinear', align_corners=False)
+        pl = F.interpolate(pl.float(),size=(256,256),mode='bilinear', align_corners=False)
 
-    # create the encoder blocks
-    encoder_blocks = []
-    for _ in range(N):
-        encoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        encoder_feed_forward_block = FeedForwardBlock(d_model, dff, dropout)
-        encoder_block = EncoderBlock(encoder_self_attention_block,encoder_feed_forward_block,dropout)
-        encoder_blocks.append(encoder_block)
+        x = torch.cat((pl, sam), dim=1)
 
-    # create the decoder blocks
-    decoder_blocks = []
-    for _ in range(N):
-        decoder_self_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        decoder_cross_attention_block = MultiHeadAttentionBlock(d_model, h, dropout)
-        decoder_feed_forward_block = FeedForwardBlock(d_model, dff, dropout)
-        decoder_block = DecoderBlock(decoder_self_attention_block,decoder_cross_attention_block,decoder_feed_forward_block,dropout)
-        decoder_blocks.append(decoder_block)
-
-    # create encoder and decoder
-    encoder = Encoder(nn.ModuleList(encoder_blocks))
-    decoder = Decoder(nn.ModuleList(decoder_blocks))
-
-    # create projection
-    projection = ProjectionLayer(d_model,tgt_vocab_size)
-
-    # create the transformer
-    transformer = Transformer(encoder, decoder, src_embedding, tgt_embedding, src_pos, tgt_pos, projection)
-
-    # initialize the model parameters
-    for param in transformer.parameters():
-        if param.dim() > 1:
-            nn.init.xavier_normal_(param)
-
-    return transformer
+        x1 = self.inc(x)
+        d1 = self.down1(x1)
+        d2 = self.down2(d1)
+        d3 = self.down3(d2)
+        d4 = self.down4(d3)
+        b ,c, h, w = d4.shape
+        d4 = d4.view(b,h*w,c)
+        attention = self.transformer_decoder(x,d4)
+        d4 = d4.view(b ,c, h, w)
+        u1 = self.up1(d4, d3)
+        u2 = self.up2(u1, d2)
+        u3 = self.up3(u2, d1)
+        u4 = self.up4(u3, x1)
+        logits = self.outc(u4)
+        return logits

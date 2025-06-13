@@ -104,10 +104,9 @@ class PatchEmbed(nn.Module):
             in_chans,
             embed_dim,
             kernel_size=patch_size,
-            stride=stride,
-            padding=(patch_size[0] // 2, patch_size[1] // 2))
+            stride=stride)
         self.norm = nn.LayerNorm(embed_dim)
-        token = math.floor((img_size[0] + 2 * (patch_size[0] // 2) - patch_size[0]) / stride) + 1
+        token = math.floor((img_size[0] + 2 * (patch_size[0] // 2) - patch_size[0]) / stride) 
         self.num_tokens= token ** 2
 
     def forward(self, x):
@@ -117,17 +116,15 @@ class PatchEmbed(nn.Module):
         x = self.norm(x)
 
         return x
-
 class Encoder(nn.Module):
     def __init__(self,device,num_blocks=6,img_size=256,
-                 patch_size=7,
-                 stride=4,
+                 patch_size=8,
+                 stride=8,
                  in_chans=1,
                  embed_dim=768):
         super().__init__()
         self.sam_embed = PatchEmbed(img_size=img_size,patch_size=patch_size,stride=stride,in_chans=in_chans,embed_dim=embed_dim)
-        self.pl_embed = PatchEmbed(img_size=img_size,patch_size=patch_size,stride=stride,in_chans=in_chans,embed_dim=embed_dim)
-        num_seq = self.pl_embed.num_tokens
+        num_seq = self.sam_embed.num_tokens
         self.pos_embed = nn.Embedding(num_seq,embed_dim)
         self.register_buffer("positions",torch.arange(num_seq,device=device))
 
@@ -137,7 +134,7 @@ class Encoder(nn.Module):
     def forward(self, sam, pl_source):
         positions = self.pos_embed(self.positions)
         sam_embed = self.sam_embed(sam) + positions
-        pl_embed = self.pl_embed(pl_source) + positions
+        pl_embed = pl_source + positions
 
         for layer in self.encode:
             sam,pl_source = layer(sam_embed,pl_embed)
@@ -150,7 +147,7 @@ class DecoderLinear(nn.Module):
         self.d_encoder = d_encoder
         self.patch_size = patch_size
         self.n_cls = n_cls
-        self.num_token = math.floor((img_size + 2 * (patch_size // 2) - patch_size) / stride) + 1
+        self.num_token = math.floor((img_size + 2 * (patch_size // 2) - patch_size) / stride) 
 
         self.head = nn.Sequential(
             nn.Upsample(scale_factor=2,mode="bilinear",align_corners=False),
@@ -171,10 +168,10 @@ class DecoderLinear(nn.Module):
 
 class EncodeDecode(nn.Module):
     def __init__(self,device,img_size=256,
-                 patch_size=7,
-                 stride=4,
+                 patch_size=16,
+                 stride=16,
                  in_chans=1,
-                 embed_dim=768):
+                 embed_dim=1024):
         super().__init__()
         self.encode = Encoder(device,img_size=img_size,patch_size=patch_size,stride=stride,in_chans=in_chans,embed_dim=embed_dim)
         self.fuse = nn.Sequential(
@@ -186,8 +183,8 @@ class EncodeDecode(nn.Module):
         )
         self.decode = DecoderLinear(n_cls=2,patch_size=patch_size,d_encoder=embed_dim,img_size=img_size,stride=stride)
 
-        self.sam_skip = nn.Conv2d(1,2,kernel_size=3,padding=1)
-        self.pl_skip = nn.Conv2d(1,2,kernel_size=3,padding=1)
+        self.sam_skip = nn.Conv2d(2,2,kernel_size=3,padding=1)
+        self.pl_skip = nn.Conv2d(4,2,kernel_size=3,padding=1)
 
 
         self.num_token = self.decode.num_token
@@ -196,12 +193,12 @@ class EncodeDecode(nn.Module):
         
     def forward(self, sam, pl_source):
 
-        sam = F.interpolate(sam.float(),size=(256,256),mode='bilinear', align_corners=False)
-        pl_source = F.interpolate(pl_source.float(),size=(256,256),mode='bilinear', align_corners=False)
-        sam_latent,pl_source_latent = self.encode(sam,pl_source + sam) # adding sam and pl as pl
+        #sam = F.interpolate(sam.float(),size=(256,256),mode='bilinear', align_corners=False)
+        #pl_source = F.interpolate(pl_source.float(),size=(256,256),mode='bilinear', align_corners=False)
+        sam_latent,pl_source_latent = self.encode(sam,pl_source) # adding sam and pl as pl
         sam_latent = rearrange(sam_latent, "b (h w) c -> b c h w", h=self.num_token)
         pl_source_latent = rearrange(pl_source_latent, "b (h w) c -> b c h w", h=self.num_token)
         x = torch.cat([sam_latent,pl_source_latent],dim=1) 
         x = self.fuse(x)
         x = rearrange(x, "b c h w -> b (h w) c", h=self.num_token)
-        return self.decode(x) * (self.sam_skip(sam) + self.pl_skip(pl_source+sam))
+        return self.decode(x)
