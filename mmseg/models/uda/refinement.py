@@ -117,7 +117,7 @@ class PatchEmbed(nn.Module):
 
         return x
 class Encoder(nn.Module):
-    def __init__(self,device,num_blocks=6,img_size=256,
+    def __init__(self,device,num_blocks=21,img_size=256,
                  patch_size=8,
                  stride=8,
                  in_chans=1,

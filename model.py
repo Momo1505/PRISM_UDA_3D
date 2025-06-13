@@ -425,4 +425,4 @@ class UNet(nn.Module):
         u3 = self.up3(u2, d1)
         u4 = self.up4(u3, x1)
         logits = self.outc(u4)
-        return logits
+        return logits * attention
