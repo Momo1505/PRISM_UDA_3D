@@ -47,7 +47,7 @@ from mmseg.models.uda.refinement import EncodeDecode
 from mmseg.models.uda.swinir_backbone import MGDNRefinement
 from torch.cuda.amp.grad_scaler import GradScaler
 import json
-# from model import build_transformer
+from model import UNet
 #from mmseg.models.uda.refinement import EncodeDecode
 
 
@@ -242,7 +242,7 @@ class DACS(UDADecorator):
         if network is None : #Initialization du réseau et tutti quanti
             #network = UNet() #For binary
             #network = UNet(n_classes=19) #For multilabel
-            network = EncodeDecode("cpu")
+            network = UNet(2,2)
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
         # resizing the tensors
@@ -457,7 +457,7 @@ class DACS(UDADecorator):
             self._init_ema_weights()
             # assert _params_equal(self.get_ema_model(), self.get_model())
 
-        if self.local_iter > 0:
+        if self.local_iter > 0 and self.local_iter <=32500:
             self._update_ema(self.local_iter)
             # assert not _params_equal(self.get_ema_model(), self.get_model())
             # assert self.get_ema_model().training
@@ -575,11 +575,11 @@ class DACS(UDADecorator):
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
             #if (self.local_iter < 7500):
-            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and self.local_iter < 12500):
+            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and (self.local_iter >= 20000 and self.local_iter < 32500)) :
                 self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev,gt_class_weights)
 
             #if (self.local_iter < 7500):
-            if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) :
+            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and self.local_iter >= 20000) :
                 with torch.no_grad():
                     self.network.eval()
                     pseudo_label = pseudo_label.unsqueeze(1)
