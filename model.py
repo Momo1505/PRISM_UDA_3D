@@ -406,8 +406,8 @@ class UNet(nn.Module):
         self.outc = OutConv(64, n_classes)
 
     def forward(self, sam,pl):
-        sam = F.interpolate(sam.float(),size=(256,256),mode='bilinear', align_corners=False)
-        pl = F.interpolate(pl.float(),size=(256,256),mode='bilinear', align_corners=False)
+        sam = F.interpolate(sam.float(),size=(256,256),mode='nearest')
+        pl = F.interpolate(pl.float(),size=(256,256),mode='nearest')
 
         x = torch.cat((pl, sam), dim=1)
 

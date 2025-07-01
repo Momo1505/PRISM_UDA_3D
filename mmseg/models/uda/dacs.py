@@ -246,7 +246,7 @@ class DACS(UDADecorator):
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
         # resizing the tensors
-        gt_source = F.interpolate(gt_source.float(),size=(256,256),mode='bilinear', align_corners=False)
+        gt_source = F.interpolate(gt_source.float(),size=(256,256),mode='nearest')
         network.train()
         #ce_loss = torch.nn.BCEWithLogitsLoss() #uncomment for binary
         ce_loss = nn.CrossEntropyLoss(ignore_index=255) #For multilabel
@@ -652,7 +652,7 @@ class DACS(UDADecorator):
                                         f'{(self.local_iter + 1):06d}_pl_raffiné.png'))
 
                     #Let it uncommented for both
-                    pseudo_label = F.interpolate(pseudo_label.float(),size=(1024,1024),mode='bilinear', align_corners=False).long()
+                    pseudo_label = F.interpolate(pseudo_label.float(),size=(1024,1024),mode='nearest').long()
                     pseudo_label = pseudo_label.squeeze(1)
                 
 
