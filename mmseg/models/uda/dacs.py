@@ -280,8 +280,7 @@ class DACS(UDADecorator):
         preds = network(inputs) 
         pl_preds = preds[:,0,:,:]
         sam_preds = preds[:,1,:,:]
-        reconstructed = torch.max(pl_preds, sam_preds)
-        loss = 5*ce_loss(pl_preds, pl_source.squeeze(1)) + ce_loss(sam_preds, sam_source.squeeze(1)) +  ce_loss(reconstructed, inputs.squeeze(1))
+        loss = 5*ce_loss(pl_preds, pl_source.squeeze(1)) + ce_loss(sam_preds, sam_source.squeeze(1))
         print("pred_shape", pl_preds.shape, "pred_unique", np.unique(pl_preds.detach().cpu().numpy()))
         print("pred_shape", gt_source.shape, "pred_unique", np.unique(gt_source.detach().cpu().numpy()))
         #loss = ce_loss(pred, gt_source.float()) #uncomment for binary
