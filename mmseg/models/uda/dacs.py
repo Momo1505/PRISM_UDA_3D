@@ -47,8 +47,11 @@ from mmseg.models.uda.refinement import EncodeDecode
 from mmseg.models.uda.swinir_backbone import MGDNRefinement
 from torch.cuda.amp.grad_scaler import GradScaler
 import json
-from model import UNet
 #from mmseg.models.uda.refinement import EncodeDecode
+from get_results import calculate_iou_and_dice
+import pandas as pd
+from PIL import Image
+from torchvision import transforms
 
 
 def _params_equal(ema_model, model):
@@ -121,6 +124,20 @@ class DACS(UDADecorator):
         #self.attention_type = cfg["attention_type"]
         self.source = cfg["source"]
         self.scaler = GradScaler()
+
+        # defining dataframe for logging
+        self.train_results_df = pd.DataFrame(columns=[
+            'iteration', 
+            'ema_vs_gt_iou', 'sam_vs_gt_iou', 'pl_vs_gt_iou', 
+            'ema_vs_pl_iou', 'sam_vs_pl_iou'
+        ])
+
+        self.test_results_df = pd.DataFrame(columns=[
+            'iteration', 
+            'ema_vs_gt_iou', 'sam_vs_gt_iou', 'pl_vs_gt_iou', 
+            'ema_vs_pl_iou', 'sam_vs_pl_iou'
+        ])
+        self.transform = transforms.Resize((256,256))
 
         with open(f"data/{self.source}/sample_class_stats_dict.json","r") as of:
             self.sample_class_dict = json.load(of)
@@ -242,27 +259,45 @@ class DACS(UDADecorator):
         if network is None : #Initialization du réseau et tutti quanti
             #network = UNet() #For binary
             #network = UNet(n_classes=19) #For multilabel
-            network = UNet(2,2)
+            network = UNet(1,2)
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
-        # resizing the tensors
-        gt_source = F.interpolate(gt_source.float(),size=(256,256),mode='nearest')
-        network.train()
-        #ce_loss = torch.nn.BCEWithLogitsLoss() #uncomment for binary
-        ce_loss = nn.CrossEntropyLoss(ignore_index=255) #For multilabel
+
         pl_source = pl_source.unsqueeze(1)
+        # resizing the tensors
+        inputs = (sam_source | pl_source).to(torch.float)
+        inputs = F.interpolate(inputs,size=(256,256),mode='nearest')
+        gt_source = F.interpolate(gt_source.to(torch.float),size=(256,256),mode='nearest')
+        sam_source = F.interpolate(sam_source.to(torch.float),size=(256,256),mode='nearest')
+        pl_source = F.interpolate(pl_source.to(torch.float),size=(256,256),mode='nearest')
+
+
+        network.train()
+        ce_loss = nn.BCEWithLogitsLoss() #uncomment for binary
+        #ce_loss = nn.CrossEntropyLoss(ignore_index=255) #For multilabel
         #concat = torch.cat((pl_source, sam_source), dim=1).float()
         
-        pred = network(sam_source,pl_source)
-        print("pred_shape", pred.shape, "pred_unique", np.unique(pred.detach().cpu().numpy()))
+        preds = network(inputs) 
+        pl_preds = preds[:,0,:,:]
+        sam_preds = preds[:,1,:,:]
+        reconstructed = torch.max(pl_preds, sam_preds)
+        loss = 5*ce_loss(pl_preds, pl_source.squeeze(1)) + ce_loss(sam_preds, sam_source.squeeze(1)) +  ce_loss(reconstructed, inputs.squeeze(1))
+        print("pred_shape", pl_preds.shape, "pred_unique", np.unique(pl_preds.detach().cpu().numpy()))
         print("pred_shape", gt_source.shape, "pred_unique", np.unique(gt_source.detach().cpu().numpy()))
         #loss = ce_loss(pred, gt_source.float()) #uncomment for binary
-        loss = ce_loss(pred, gt_source.squeeze(1).long()) #for multilabel
+        #loss = ce_loss(pred, gt_source.squeeze(1).long()) #for multilabel
         optimizer.zero_grad()
         loss.backward()
         self.refin_loss_list.append(loss.item())
         optimizer.step()
         self.plot_loss_evolution(self.refin_loss_list,plot_name="refin_loss.png")
+
+        # logging the iou scores
+        pl = (pl_preds.sigmoid()>0.5).detach().cpu().to(torch.long).numpy()
+        sam_source = sam_source.detach().cpu().to(torch.long).numpy()
+        pl_source = pl_source.detach().cpu().to(torch.long).numpy()
+
+        logging(self.train_cfg['work_dir'],pl_source, sam_source, gt_source.detach().cpu().long().numpy(),pl,self.train_results_df,self.local_iter)
 
         return network, optimizer
 
@@ -575,7 +610,7 @@ class DACS(UDADecorator):
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
             #if (self.local_iter < 7500):
-            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and (self.local_iter < 12500)) :
+            if (self.local_iter > 1000) and (self.local_iter < 12500) :
                 self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev,gt_class_weights)
 
             #if (self.local_iter < 7500):
@@ -583,12 +618,17 @@ class DACS(UDADecorator):
                 with torch.no_grad():
                     self.network.eval()
                     pseudo_label = pseudo_label.unsqueeze(1)
+                    ema = pseudo_label.clone().detach().cpu()
+                    inputs = (target_sam | pseudo_label).to(torch.float)
+                    pseudo_label = F.interpolate(pseudo_label.to(torch.float),size=(256,256),mode='nearest')
+                    target_sam = F.interpolate(target_sam.to(torch.float),size=(256,256),mode='nearest')
+                    inputs = F.interpolate(inputs,size=(256,256),mode='nearest')
                     #concat = torch.cat((pseudo_label, target_sam), dim=1).float()
-                    pseudo_label_ref = self.network(target_sam,pseudo_label)
+                    pseudo_label_ref = self.network(inputs)[:,0,:,:]
                     pseudo_label = pseudo_label.squeeze(1)
 
-                    softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+                    #softmax = torch.nn.Softmax(dim=1)
+                    pseudo_label_ref2 = (pseudo_label_ref.sigmoid() > 0.5).to(torch.float)
 
                     #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
                     #plt.show()
@@ -622,7 +662,7 @@ class DACS(UDADecorator):
                     axs[2].imshow(target_sam[j].cpu().numpy().astype(np.float32)[0, :, :], cmap='gray')
                     axs[2].set_title('Target SAM')
 
-                    axs[3].imshow(pseudo_label_ref[j].cpu().numpy().astype(np.float32)[0, :, :], cmap='gray')  # New plot
+                    axs[3].imshow(pseudo_label_ref[j].cpu().numpy().astype(np.float32), cmap='gray')  # New plot
                     axs[3].set_title('Pseudo Label Ref')
 
                     subplotimg(axs[4],pseudo_label_ref2[j].cpu().numpy().astype(np.float32)[:, :],'pl_after_post')
@@ -646,14 +686,24 @@ class DACS(UDADecorator):
                     #pseudo_label = (pseudo_label_ref.squeeze(1)>0.5).long()
                     
                     #For multilabel segmentation
-                    softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+                    #softmax = torch.nn.Softmax(dim=1)
+                    pseudo_label = (pseudo_label_ref.sigmoid() > 0.5).to(torch.float)
                     save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy().astype(np.float32), os.path.join(out_dir,
                                         f'{(self.local_iter + 1):06d}_pl_raffiné.png'))
 
                     #Let it uncommented for both
-                    pseudo_label = F.interpolate(pseudo_label.float(),size=(1024,1024),mode='nearest').long()
+                    pl = pseudo_label.clone().detach().cpu()
+                    #print("pseudo_label shape",pseudo_label.shape)
+                    pseudo_label = F.interpolate(pseudo_label.unsqueeze(1),size=(1024,1024),mode='nearest').to(torch.long)
                     pseudo_label = pseudo_label.squeeze(1)
+
+                    # target gt
+                    target_file_name = target_img_metas[0]["filename"].replace("images","labels")
+                    img_target = Image.open(target_file_name ).convert("P")
+                    target_gt = np.array(self.transform(img_target))
+                    target_sam = F.interpolate(target_sam.float(),size=(256,256),mode='nearest').long().detach().cpu().numpy()
+                    ema = F.interpolate(ema.float(),size=(256,256),mode='nearest').long().cpu().numpy()
+                    logging(self.train_cfg['work_dir'],ema, target_sam, target_gt,pl.long().numpy(),self.test_results_df,self.local_iter,False)
                 
 
             # Apply mixing
@@ -811,3 +861,37 @@ class DACS(UDADecorator):
 
         return log_vars
     
+def save_iou_plot(results_df, save_path="iou_plot.png"):
+    plt.figure(figsize=(8, 5))
+    plt.plot(results_df['iteration'], results_df['ema_vs_gt_iou'], label='EMA vs GT')
+    plt.plot(results_df['iteration'], results_df['sam_vs_gt_iou'], label='SAM vs GT')
+    plt.plot(results_df['iteration'], results_df['pl_vs_gt_iou'], label='PL vs GT')
+    plt.plot(results_df['iteration'], results_df['ema_vs_pl_iou'], label='EMA vs PL')
+    plt.plot(results_df['iteration'], results_df['sam_vs_pl_iou'], label='SAM vs PL')
+    plt.xlabel('Iteration')
+    plt.ylabel('IoU')
+    plt.title('IoU over Iterations')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
+
+def logging(path,pl_source, sam_source, gt_source,pl,df,iteration,is_train=True):
+
+    ema_vs_gt,_ = calculate_iou_and_dice(pl_source,gt_source)
+    sam_vs_gt,_ = calculate_iou_and_dice(sam_source,gt_source)
+    pl_vs_gt,_ = calculate_iou_and_dice(pl,gt_source)
+    ema_vs_pl,_ = calculate_iou_and_dice(pl_source,pl)
+    sam_vs_pl,_ = calculate_iou_and_dice(sam_source,pl)
+
+    # Append to DataFrame
+    df.loc[len(df)] = [
+        iteration, 
+        ema_vs_gt, sam_vs_gt, pl_vs_gt, 
+        ema_vs_pl, sam_vs_pl
+    ]
+    plot_path = os.path.join(path,"train_iou_plot.png") if is_train else os.path.join(path,"test_iou_plot.png")
+    csv_path = os.path.join(path,"train_iou_log_final.csv") if is_train else os.path.join(path,"test_iou_log_final.csv") 
+    save_iou_plot(df, save_path=plot_path)
+    df.to_csv(csv_path, index=False)
