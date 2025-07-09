@@ -390,9 +390,6 @@ class UNet(nn.Module):
         self.bilinear = bilinear
         self.norm_layer = norm_layer
 
-        self.transformer_decoder = EncodeDecode("cpu",in_chans=2)
-        self.num_token = self.transformer_decoder.num_token
-
         self.inc = DoubleConvPerso(in_channel, 64, norm_layer)
         self.down1 = Down(64, 128, norm_layer)
         self.down2 = Down(128, 256, norm_layer)
@@ -405,24 +402,29 @@ class UNet(nn.Module):
         self.up4 = Up(128, 64, norm_layer, bilinear)
         self.outc = OutConv(64, n_classes)
 
-    def forward(self, sam,pl):
-        sam = F.interpolate(sam.float(),size=(256,256),mode='nearest')
-        pl = F.interpolate(pl.float(),size=(256,256),mode='nearest')
+        self.up11 = Up(1024, 512 // factor, norm_layer, bilinear)
+        self.up21 = Up(512, 256 // factor, norm_layer, bilinear)
+        self.up31 = Up(256, 128 // factor, norm_layer, bilinear)
+        self.up41 = Up(128, 64, norm_layer, bilinear)
+        self.outc1 = OutConv(64, n_classes)
 
-        x = torch.cat((pl, sam), dim=1)
-
+    def forward(self, x):
         x1 = self.inc(x)
         d1 = self.down1(x1)
         d2 = self.down2(d1)
         d3 = self.down3(d2)
         d4 = self.down4(d3)
-        b ,c, h, w = d4.shape
-        d4 = d4.view(b,h*w,c)
-        attention = self.transformer_decoder(x,d4)
-        d4 = d4.view(b ,c, h, w)
         u1 = self.up1(d4, d3)
         u2 = self.up2(u1, d2)
         u3 = self.up3(u2, d1)
         u4 = self.up4(u3, x1)
-        logits = self.outc(u4)
-        return logits * attention
+        sam_logits = self.outc(u4)
+
+        u11 = self.up11(d4, u1)
+        u21 = self.up21(u11, u2)
+        u31 = self.up31(u21, u3)
+        u41 = self.up41(u31, u4)
+
+        pl_logits = self.outc1(u41)
+
+        return sam_logits,pl_logits
