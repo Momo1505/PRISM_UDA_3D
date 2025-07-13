@@ -390,7 +390,10 @@ class UNet(nn.Module):
         self.bilinear = bilinear
         self.norm_layer = norm_layer
 
-        self.inc = DoubleConvPerso(in_channel, 64, norm_layer)
+        self.inc = nn.Sequential(
+            DoubleConvPerso(in_channel, 128, norm_layer),
+            DoubleConvPerso(128, 64, norm_layer)
+        )
         self.down1 = Down(64, 128, norm_layer)
         self.down2 = Down(128, 256, norm_layer)
         self.down3 = Down(256, 512, norm_layer)
@@ -400,7 +403,7 @@ class UNet(nn.Module):
         self.up2 = Up(512, 256 // factor, norm_layer, bilinear)
         self.up3 = Up(256, 128 // factor, norm_layer, bilinear)
         self.up4 = Up(128, 64, norm_layer, bilinear)
-        self.outc = OutConv(64, n_classes)
+        self.outc = OutConv(64, 4)
 
         self.up11 = Up(1024, 512 // factor, norm_layer, bilinear)
         self.up21 = Up(512, 256 // factor, norm_layer, bilinear)

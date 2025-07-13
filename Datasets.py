@@ -134,15 +134,18 @@ class DistributionDataset(Dataset):
         return gt_image
     
 class WeihToI3(Dataset):
-    def __init__(self,data_root="data/I3/",mode="train",mask_type="colour"):
+    def __init__(self,train_data_root="data/WeiH/",val_data_root="data/I3/",mode="train",mask_type="colour"):
         super().__init__()
-        self.pl_paths = glob.glob(os.path.join(data_root,"pl_preds","*.png"),recursive=True)
-        train_size = int(len(self.pl_paths)*0.7)
+        
         if mode == "train":
+            self.pl_paths = glob.glob(os.path.join(train_data_root,"pl_preds","*.png"),recursive=True)
+            train_size = int(len(self.pl_paths)*0.7)
             self.pl_paths = self.pl_paths[:train_size]
             self.sam_paths = list(map(self.transform_to_sam,self.pl_paths))
             self.val_paths = list(map(self.transform_to_label,self.pl_paths))
         else:
+            self.pl_paths = glob.glob(os.path.join(val_data_root,"pl_preds","*.png"),recursive=True)
+            train_size = int(len(self.pl_paths)*0.7)
             self.pl_paths = self.pl_paths[train_size:]
             self.sam_paths = list(map(self.transform_to_sam,self.pl_paths))
             self.val_paths = list(map(self.transform_to_label,self.pl_paths))

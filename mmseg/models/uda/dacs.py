@@ -39,7 +39,7 @@ from mmseg.models.utils.dacs_transforms import (denorm, get_class_masks,
 from mmseg.models.utils.visualization import prepare_debug_out, subplotimg
 from mmseg.utils.utils import downscale_label_ratio
 from plot import save_segmentation_map
-from mmseg.models.segmentors.base import UNet
+#from mmseg.models.segmentors.base import UNet
 import torch.nn as nn
 from matplotlib.colors import ListedColormap
 from mmseg.datasets import CityscapesDataset
@@ -52,6 +52,9 @@ from get_results import calculate_iou_and_dice
 import pandas as pd
 from PIL import Image
 from torchvision import transforms
+from torch.utils.tensorboard import SummaryWriter
+import cv2
+from model import UNet
 
 
 def _params_equal(ema_model, model):
@@ -126,18 +129,9 @@ class DACS(UDADecorator):
         self.scaler = GradScaler()
 
         # defining dataframe for logging
-        self.train_results_df = pd.DataFrame(columns=[
-            'iteration', 
-            'ema_vs_gt_iou', 'sam_vs_gt_iou', 'pl_vs_gt_iou', 
-            'ema_vs_pl_iou', 'sam_vs_pl_iou'
-        ])
-
-        self.test_results_df = pd.DataFrame(columns=[
-            'iteration', 
-            'ema_vs_gt_iou', 'sam_vs_gt_iou', 'pl_vs_gt_iou', 
-            'ema_vs_pl_iou', 'sam_vs_pl_iou'
-        ])
         self.transform = transforms.Resize((256,256))
+
+        self.writer = SummaryWriter(log_dir=self.train_cfg['work_dir'])
 
         with open(f"data/{self.source}/sample_class_stats_dict.json","r") as of:
             self.sample_class_dict = json.load(of)
@@ -259,30 +253,28 @@ class DACS(UDADecorator):
         if network is None : #Initialization du réseau et tutti quanti
             #network = UNet() #For binary
             #network = UNet(n_classes=19) #For multilabel
-            network = UNet(1,2)
+            network = UNet(512,2)
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
 
         pl_source = pl_source.unsqueeze(1)
         # resizing the tensors
-        inputs = (sam_source | pl_source).to(torch.float)
-        inputs = F.interpolate(inputs,size=(256,256),mode='nearest')
         gt_source = F.interpolate(gt_source.to(torch.float),size=(256,256),mode='nearest')
         sam_source = F.interpolate(sam_source.to(torch.float),size=(256,256),mode='nearest')
         pl_source = F.interpolate(pl_source.to(torch.float),size=(256,256),mode='nearest')
+        inputs =  batch_extract_components(pl_source.to(torch.int) , sam_source.to(torch.int))
+        mask_origin = build_origin_mask(pl_source.to(torch.int) , sam_source.to(torch.int))
 
 
         network.train()
-        ce_loss = nn.BCEWithLogitsLoss() #uncomment for binary
-        #ce_loss = nn.CrossEntropyLoss(ignore_index=255) #For multilabel
+        #ce_loss = nn.BCEWithLogitsLoss() #uncomment for binary
+        ce_loss = nn.CrossEntropyLoss(ignore_index=255) #For multilabel
         #concat = torch.cat((pl_source, sam_source), dim=1).float()
         
-        preds = network(inputs) 
-        pl_preds = preds[:,0,:,:]
-        sam_preds = preds[:,1,:,:]
-        loss = 5*ce_loss(pl_preds, pl_source.squeeze(1)) + ce_loss(sam_preds, sam_source.squeeze(1))
+        mask_origin_preds,pl_preds = network(inputs.to(torch.float)) 
+        loss = 5*ce_loss(pl_preds, gt_source.to(torch.long).squeeze(1)) + ce_loss(mask_origin_preds, mask_origin.to(torch.long).squeeze(1))
         print("pred_shape", pl_preds.shape, "pred_unique", np.unique(pl_preds.detach().cpu().numpy()))
-        print("pred_shape", gt_source.shape, "pred_unique", np.unique(gt_source.detach().cpu().numpy()))
+        print("gt_source_shape", gt_source.shape, "gt_source_unique", np.unique(gt_source.detach().cpu().numpy()))
         #loss = ce_loss(pred, gt_source.float()) #uncomment for binary
         #loss = ce_loss(pred, gt_source.squeeze(1).long()) #for multilabel
         optimizer.zero_grad()
@@ -292,11 +284,11 @@ class DACS(UDADecorator):
         self.plot_loss_evolution(self.refin_loss_list,plot_name="refin_loss.png")
 
         # logging the iou scores
-        pl = (pl_preds.sigmoid()>0.5).detach().cpu().to(torch.long).numpy()
+        pl = pl_preds.argmax(dim=1).detach().cpu().to(torch.long).numpy()
         sam_source = sam_source.detach().cpu().to(torch.long).numpy()
         pl_source = pl_source.detach().cpu().to(torch.long).numpy()
 
-        logging(self.train_cfg['work_dir'],pl_source, sam_source, gt_source.detach().cpu().long().numpy(),pl,self.train_results_df,self.local_iter)
+        logging(self.writer,pl_source, sam_source, gt_source.detach().cpu().long().numpy(),pl,self.local_iter)
 
         return network, optimizer
 
@@ -609,25 +601,25 @@ class DACS(UDADecorator):
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
             #if (self.local_iter < 7500):
-            if (self.local_iter > 2000) and (self.local_iter < 12500) :
+            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter)) and (self.local_iter < 12500) :
                 self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev,gt_class_weights)
 
             #if (self.local_iter < 7500):
-            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) and (self.local_iter > 2000)) :
+            if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter) :
                 with torch.no_grad():
                     self.network.eval()
                     pseudo_label = pseudo_label.unsqueeze(1)
                     ema = pseudo_label.clone().detach().cpu()
-                    inputs = (target_sam | pseudo_label).to(torch.float)
                     pseudo_label = F.interpolate(pseudo_label.to(torch.float),size=(256,256),mode='nearest')
                     target_sam = F.interpolate(target_sam.to(torch.float),size=(256,256),mode='nearest')
-                    inputs = F.interpolate(inputs,size=(256,256),mode='nearest')
+                    inputs = batch_extract_components(target_sam.to(torch.int) , pseudo_label.to(torch.int)).to(torch.float)
+            
                     #concat = torch.cat((pseudo_label, target_sam), dim=1).float()
-                    pseudo_label_ref = self.network(inputs)[:,0,:,:]
+                    _,pseudo_label_ref = self.network(inputs)
                     pseudo_label = pseudo_label.squeeze(1)
 
                     #softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label_ref2 = (pseudo_label_ref.sigmoid() > 0.5).to(torch.float)
+                    pseudo_label_ref2 = pseudo_label_ref.argmax(dim=1).to(torch.float)
 
                     #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
                     #plt.show()
@@ -661,7 +653,7 @@ class DACS(UDADecorator):
                     axs[2].imshow(target_sam[j].cpu().numpy().astype(np.float32)[0, :, :], cmap='gray')
                     axs[2].set_title('Target SAM')
 
-                    axs[3].imshow(pseudo_label_ref[j].cpu().numpy().astype(np.float32), cmap='gray')  # New plot
+                    axs[3].imshow(pseudo_label_ref[j].cpu().numpy().astype(np.float32)[0, :, :], cmap='gray')  # New plot
                     axs[3].set_title('Pseudo Label Ref')
 
                     subplotimg(axs[4],pseudo_label_ref2[j].cpu().numpy().astype(np.float32)[:, :],'pl_after_post')
@@ -686,7 +678,7 @@ class DACS(UDADecorator):
                     
                     #For multilabel segmentation
                     #softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label = (pseudo_label_ref.sigmoid() > 0.5).to(torch.float)
+                    pseudo_label = pseudo_label_ref.argmax(dim=1).to(torch.float)
                     save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy().astype(np.float32), os.path.join(out_dir,
                                         f'{(self.local_iter + 1):06d}_pl_raffiné.png'))
 
@@ -702,7 +694,7 @@ class DACS(UDADecorator):
                     target_gt = np.array(self.transform(img_target))
                     target_sam = F.interpolate(target_sam.float(),size=(256,256),mode='nearest').long().detach().cpu().numpy()
                     ema = F.interpolate(ema.float(),size=(256,256),mode='nearest').long().cpu().numpy()
-                    logging(self.train_cfg['work_dir'],ema, target_sam, target_gt,pl.long().numpy(),self.test_results_df,self.local_iter,False)
+                    logging(self.writer,ema, target_sam, target_gt,pl.long().numpy(),self.local_iter,False)
                 
 
             # Apply mixing
@@ -876,21 +868,194 @@ def save_iou_plot(results_df, save_path="iou_plot.png"):
     plt.savefig(save_path)
     plt.close()
 
-def logging(path,pl_source, sam_source, gt_source,pl,df,iteration,is_train=True):
+def logging(writer,pl_source, sam_source, gt_source,pl_pred,iteration,is_train=True):
 
-    ema_vs_gt,_ = calculate_iou_and_dice(pl_source,gt_source)
-    sam_vs_gt,_ = calculate_iou_and_dice(sam_source,gt_source)
-    pl_vs_gt,_ = calculate_iou_and_dice(pl,gt_source)
-    ema_vs_pl,_ = calculate_iou_and_dice(pl_source,pl)
-    sam_vs_pl,_ = calculate_iou_and_dice(sam_source,pl)
+    prefix = "Source" if is_train else "Target"
 
-    # Append to DataFrame
-    df.loc[len(df)] = [
-        iteration, 
-        ema_vs_gt, sam_vs_gt, pl_vs_gt, 
-        ema_vs_pl, sam_vs_pl
+    ema_vs_gt, _ = calculate_iou_and_dice(pl_source, gt_source)
+    sam_vs_gt, _ = calculate_iou_and_dice(sam_source, gt_source)
+    pl_vs_gt,  _ = calculate_iou_and_dice(pl_pred,   gt_source)
+    ema_vs_pl, _ = calculate_iou_and_dice(pl_source, pl_pred)
+    sam_vs_pl, _ = calculate_iou_and_dice(sam_source, pl_pred)
+
+    # Log scalar IoUs to TensorBoard
+    writer.add_scalar(f"{prefix}/IoU_EMA_vs_GT", ema_vs_gt, iteration)
+    writer.add_scalar(f"{prefix}/IoU_SAM_vs_GT", sam_vs_gt, iteration)
+    writer.add_scalar(f"{prefix}/IoU_PL_vs_GT", pl_vs_gt, iteration)
+    writer.add_scalar(f"{prefix}/IoU_EMA_vs_PL", ema_vs_pl, iteration)
+    writer.add_scalar(f"{prefix}/IoU_SAM_vs_PL", sam_vs_pl, iteration)
+
+    writer.flush()
+
+def extract_connected_components_fast(mask1, mask2, max_channels=32, shuffle=True):
+    """
+    Fast extraction of connected components from two binary masks using OpenCV or sklearn.
+    Each connected component is extracted individually and then randomly concatenated.
+    
+    Args:
+        mask1 (torch.Tensor): First binary mask (any shape, will be squeezed to 2D)
+        mask2 (torch.Tensor): Second binary mask (any shape, will be squeezed to 2D)
+        max_channels (int): Maximum number of channels in output tensor
+        use_opencv (bool): Whether to use OpenCV (faster) or sklearn for connected components
+    
+    Returns:
+        torch.Tensor: Shape (max_channels, H, W) with each channel containing one component
+        dict: Metadata about each component including source and original size
+    """
+    # Handle tensor shapes - convert to numpy for processing
+    original_shape = mask1.shape
+    if len(mask1.shape) > 2:
+        mask1 = mask1.squeeze()
+        mask2 = mask2.squeeze()
+    
+    # Convert to numpy for OpenCV/sklearn processing
+    mask1_np = mask1.cpu().numpy().astype(np.uint8)
+    mask2_np = mask2.cpu().numpy().astype(np.uint8)
+    
+    # Calculate different regions
+    mask1_only = mask1_np & (~mask2_np)
+    mask2_only = mask2_np & (~mask1_np)
+    intersection = mask1_np & mask2_np
+    
+    # Extract connected components from each region
+    components = []
+    metadata = []
+    
+    # Process each region separately
+    regions = [
+        (mask1_only, 'mask1_only'),
+        (mask2_only, 'mask2_only'), 
+        (intersection, 'intersection')
     ]
-    plot_path = os.path.join(path,"train_iou_plot.png") if is_train else os.path.join(path,"test_iou_plot.png")
-    csv_path = os.path.join(path,"train_iou_log_final.csv") if is_train else os.path.join(path,"test_iou_log_final.csv") 
-    save_iou_plot(df, save_path=plot_path)
-    df.to_csv(csv_path, index=False)
+    
+    for region_mask, source_name in regions:
+        if region_mask.sum() > 0:  # Only process if region has pixels
+            # OpenCV method - much faster, especially for large images
+            num_labels, labels = cv2.connectedComponents(region_mask, connectivity=4)
+            
+            # Extract each component (skip label 0 which is background)
+            for label_id in range(1, num_labels):
+                component_mask = (labels == label_id).astype(np.uint8)
+                components.append(component_mask)
+                metadata.append({
+                    'source': source_name,
+                    'size': np.sum(component_mask),
+                    'label_id': label_id
+                })
+    
+    # Convert back to torch tensors
+    if len(components) == 0:
+        # No components found - return empty tensor
+        result = torch.zeros((max_channels, *mask1.shape), dtype=torch.float32, device=mask1.device)
+        return result, []
+    
+    # Convert components to torch tensors
+    torch_components = []
+    for comp in components:
+        torch_comp = torch.from_numpy(comp).float().to(mask1.device)
+        torch_components.append(torch_comp)
+    
+    # Randomly shuffle the components - this is key for preventing ordering bias
+    combined_data = list(zip(torch_components, metadata))
+    if shuffle:
+        random.shuffle(combined_data)
+    torch_components, metadata = zip(*combined_data)
+    
+    # Create output tensor with padding
+    result = torch.zeros((max_channels, *mask1.shape), dtype=torch.float32, device=mask1.device)
+    
+    # Fill channels with components (up to max_channels)
+    num_components = min(len(torch_components), max_channels)
+    for i in range(num_components):
+        result[i] = torch_components[i]
+    
+    # Update metadata with final channel assignments
+    final_metadata = []
+    for i in range(num_components):
+        meta = dict(metadata[i])  # Copy metadata
+        meta['final_channel'] = i
+        final_metadata.append(meta)
+    
+    # Add info about unused components if any
+    if len(torch_components) > max_channels:
+        print(f"Warning: Found {len(torch_components)} components but only using {max_channels} channels. "
+              f"{len(torch_components) - max_channels} components were dropped.")
+    
+    return result, final_metadata
+
+def batch_extract_components(batch_mask1, batch_mask2, max_channels=512, shuffle=True):
+    """
+    Process a batch of mask pairs efficiently.
+    
+    Args:
+        batch_mask1 (torch.Tensor): Batch of first masks, shape (B, H, W) or (B, 1, H, W)
+        batch_mask2 (torch.Tensor): Batch of second masks, shape (B, H, W) or (B, 1, H, W)
+        max_channels (int): Maximum number of channels in output tensor
+        use_opencv (bool): Whether to use OpenCV for connected components
+    
+    Returns:
+        torch.Tensor: Shape (B, max_channels, H, W)
+        list: List of metadata dictionaries for each batch item
+    """
+    batch_size = batch_mask1.shape[0]
+    
+    # Get the spatial dimensions
+    if len(batch_mask1.shape) == 4:  # (B, C, H, W)
+        _, _, H, W = batch_mask1.shape
+    else:  # (B, H, W)
+        _, H, W = batch_mask1.shape
+    
+    # Initialize output tensor
+    batch_result = torch.zeros((batch_size, max_channels, H, W), 
+                              dtype=torch.float32, device=batch_mask1.device)
+    batch_metadata = []
+    
+    # Process each item in the batch
+    for i in range(batch_size):
+        mask1 = batch_mask1[i]
+        mask2 = batch_mask2[i]
+        
+        result, metadata = extract_connected_components_fast(
+            mask1, mask2, max_channels, shuffle
+        )
+        
+        batch_result[i] = result
+        batch_metadata.append(metadata)
+    
+    return batch_result
+
+def build_origin_mask(mask1, mask2, mask1_label=1, mask2_label=2, intersection_label=3):
+    """
+    Create a union of two binary masks with different labels for different regions.
+    
+    Args:
+        mask1 (torch.Tensor): First binary mask (0s and 1s)
+        mask2 (torch.Tensor): Second binary mask (0s and 1s)
+        mask1_label (int): Label for pixels only in mask1 (default: 1)
+        mask2_label (int): Label for pixels only in mask2 (default: 2)
+        intersection_label (int): Label for pixels in both masks (default: 3)
+    
+    Returns:
+        torch.Tensor: Combined mask with labels:
+                     - 0: background (not in either mask)
+                     - mask1_label: only in mask1
+                     - mask2_label: only in mask2
+                     - intersection_label: in both masks
+    """
+    # Ensure masks are boolean or convert to boolean
+    mask1_bool = mask1.bool()
+    mask2_bool = mask2.bool()
+    
+    # Create output tensor initialized to 0 (background)
+    result = torch.zeros_like(mask1_bool, dtype=torch.int,device=mask1.device)
+    
+    # Set regions: order matters for overlapping regions
+    result[mask1_bool] = mask1_label                    # Only mask1
+    result[mask2_bool] = mask2_label                    # Only mask2 (overwrites mask1 where they overlap)
+    
+    intersection = mask1_bool & mask2_bool
+    random_choices = torch.randint(0, 2, intersection.shape, device=mask1.device, dtype=torch.bool)
+    result[intersection & random_choices] = mask1_label
+    result[intersection & ~random_choices] = mask2_label
+    
+    return result
