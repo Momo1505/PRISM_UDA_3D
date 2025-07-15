@@ -124,6 +124,7 @@ class Encoder(nn.Module):
                  embed_dim=768):
         super().__init__()
         self.sam_embed = PatchEmbed(img_size=img_size,patch_size=patch_size,stride=stride,in_chans=in_chans,embed_dim=embed_dim)
+        self.pl_embed = PatchEmbed(img_size=img_size,patch_size=patch_size,stride=stride,in_chans=in_chans,embed_dim=embed_dim)
         num_seq = self.sam_embed.num_tokens
         self.pos_embed = nn.Embedding(num_seq,embed_dim)
         self.register_buffer("positions",torch.arange(num_seq,device=device))
@@ -134,7 +135,7 @@ class Encoder(nn.Module):
     def forward(self, sam, pl_source):
         positions = self.pos_embed(self.positions)
         sam_embed = self.sam_embed(sam) + positions
-        pl_embed = pl_source + positions
+        pl_embed = self.pl_embed (pl_source) + positions
 
         for layer in self.encode:
             sam,pl_source = layer(sam_embed,pl_embed)
