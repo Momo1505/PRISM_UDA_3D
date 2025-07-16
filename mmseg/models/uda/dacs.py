@@ -55,7 +55,7 @@ from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 import cv2
 from model import UNet
-
+from scipy.ndimage import distance_transform_edt
 
 def _params_equal(ema_model, model):
     for ema_param, param in zip(ema_model.named_parameters(),
@@ -253,7 +253,7 @@ class DACS(UDADecorator):
         if network is None : #Initialization du réseau et tutti quanti
             #network = UNet() #For binary
             #network = UNet(n_classes=19) #For multilabel
-            network = UNet(512,2)
+            network = EncodeDecode("cpu")
             network = network.to(device)
             optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
 
@@ -262,21 +262,17 @@ class DACS(UDADecorator):
         gt_source = F.interpolate(gt_source.to(torch.float),size=(256,256),mode='nearest')
         sam_source = F.interpolate(sam_source.to(torch.float),size=(256,256),mode='nearest')
         pl_source = F.interpolate(pl_source.to(torch.float),size=(256,256),mode='nearest')
-        inputs =  batch_extract_components(pl_source.to(torch.int) , sam_source.to(torch.int))
-        mask_origin = build_origin_mask(pl_source.to(torch.int) , sam_source.to(torch.int))
-
+        mask_1,mask_2 =  extract_mix_redistribute_components(pl_source.to(torch.int) , sam_source.to(torch.int))
 
         network.train()
-        #ce_loss = nn.BCEWithLogitsLoss() #uncomment for binary
         ce_loss = nn.CrossEntropyLoss(ignore_index=255) #For multilabel
-        #concat = torch.cat((pl_source, sam_source), dim=1).float()
         
-        mask_origin_preds,pl_preds = network(inputs.to(torch.float)) 
-        loss = 5*ce_loss(pl_preds, gt_source.to(torch.long).squeeze(1)) + ce_loss(mask_origin_preds, mask_origin.to(torch.long).squeeze(1))
+        pl_preds = network(mask_1.to(torch.float),mask_2.to(torch.float)) 
+        dice = dice_loss(pl_preds, gt_source.squeeze(1).to(torch.long))
+        loss = ce_loss(pl_preds, gt_source.to(torch.long).squeeze(1)) + dice
         print("pred_shape", pl_preds.shape, "pred_unique", np.unique(pl_preds.detach().cpu().numpy()))
         print("gt_source_shape", gt_source.shape, "gt_source_unique", np.unique(gt_source.detach().cpu().numpy()))
-        #loss = ce_loss(pred, gt_source.float()) #uncomment for binary
-        #loss = ce_loss(pred, gt_source.squeeze(1).long()) #for multilabel
+
         optimizer.zero_grad()
         loss.backward()
         self.refin_loss_list.append(loss.item())
@@ -612,10 +608,10 @@ class DACS(UDADecorator):
                     ema = pseudo_label.clone().detach().cpu()
                     pseudo_label = F.interpolate(pseudo_label.to(torch.float),size=(256,256),mode='nearest')
                     target_sam = F.interpolate(target_sam.to(torch.float),size=(256,256),mode='nearest')
-                    inputs = batch_extract_components(target_sam.to(torch.int) , pseudo_label.to(torch.int)).to(torch.float)
+                    mask_1,mask_2 =  extract_mix_redistribute_components(pseudo_label.to(torch.int) , target_sam.to(torch.int),False)
             
                     #concat = torch.cat((pseudo_label, target_sam), dim=1).float()
-                    _,pseudo_label_ref = self.network(inputs)
+                    pseudo_label_ref = self.network(mask_1.to(torch.float),mask_2.to(torch.float)) 
                     pseudo_label = pseudo_label.squeeze(1)
 
                     #softmax = torch.nn.Softmax(dim=1)
@@ -887,41 +883,73 @@ def logging(writer,pl_source, sam_source, gt_source,pl_pred,iteration,is_train=T
 
     writer.flush()
 
-def extract_connected_components_fast(mask1, mask2, max_channels=32, shuffle=True):
+def compute_sdf(mask: np.ndarray) -> np.ndarray:
     """
-    Fast extraction of connected components from two binary masks using OpenCV or sklearn.
-    Each connected component is extracted individually and then randomly concatenated.
+    Compute Signed Distance Field from a binary mask.
+    
+    Args:
+        mask (np.ndarray): Binary mask (0s and 1s)
+    
+    Returns:
+        np.ndarray: SDF where negative values are inside the mask, positive outside
+    """
+    # Convert to boolean for distance transform
+    mask_bool = mask.astype(bool)
+    
+    # Compute distance transform for inside (negative distances)
+    inside_distance = distance_transform_edt(mask_bool)
+    
+    # Compute distance transform for outside (positive distances)
+    outside_distance = distance_transform_edt(~mask_bool)
+    
+    # Combine: negative inside, positive outside
+    sdf = outside_distance - inside_distance
+    
+    return sdf
+
+def extract_mix_redistribute_components(mask1: torch.Tensor, mask2: torch.Tensor, 
+                                      shuffle: bool = True, 
+                                      min_component_size: int = 10,
+                                      return_sdf: bool = True):
+    """
+    Extract connected components from two masks, mix them, and redistribute into two new masks.
+    Optimized version using OpenCV for maximum performance.
     
     Args:
         mask1 (torch.Tensor): First binary mask (any shape, will be squeezed to 2D)
         mask2 (torch.Tensor): Second binary mask (any shape, will be squeezed to 2D)
-        max_channels (int): Maximum number of channels in output tensor
-        use_opencv (bool): Whether to use OpenCV (faster) or sklearn for connected components
+        shuffle (bool): Whether to randomly shuffle components before redistribution
+        min_component_size (int): Minimum size for a component to be kept
+        return_sdf (bool): Whether to return SDF maps instead of binary masks
     
     Returns:
-        torch.Tensor: Shape (max_channels, H, W) with each channel containing one component
-        dict: Metadata about each component including source and original size
+        Tuple[torch.Tensor, torch.Tensor, Dict]: Two redistributed masks/SDFs (same shape as input) and metadata
     """
     # Handle tensor shapes - convert to numpy for processing
-    original_shape = mask1.shape
+    original_device = mask1.device
+    original_dtype = mask1.dtype
+    original_shape1 = mask1.shape
+    original_shape2 = mask2.shape
+    
     if len(mask1.shape) > 2:
         mask1 = mask1.squeeze()
         mask2 = mask2.squeeze()
     
-    # Convert to numpy for OpenCV/sklearn processing
+    # Convert to numpy for OpenCV processing
     mask1_np = mask1.cpu().numpy().astype(np.uint8)
     mask2_np = mask2.cpu().numpy().astype(np.uint8)
+    H, W = mask1_np.shape
     
-    # Calculate different regions
+    # Calculate different regions for efficient component extraction
     mask1_only = mask1_np & (~mask2_np)
     mask2_only = mask2_np & (~mask1_np)
     intersection = mask1_np & mask2_np
     
-    # Extract connected components from each region
-    components = []
-    metadata = []
+    # Extract all components efficiently
+    all_components = []
+    component_metadata = []
     
-    # Process each region separately
+    # Process each region separately for better performance
     regions = [
         (mask1_only, 'mask1_only'),
         (mask2_only, 'mask2_only'), 
@@ -930,100 +958,118 @@ def extract_connected_components_fast(mask1, mask2, max_channels=32, shuffle=Tru
     
     for region_mask, source_name in regions:
         if region_mask.sum() > 0:  # Only process if region has pixels
-            # OpenCV method - much faster, especially for large images
+            # OpenCV connected components - fastest method
             num_labels, labels = cv2.connectedComponents(region_mask, connectivity=4)
             
             # Extract each component (skip label 0 which is background)
             for label_id in range(1, num_labels):
                 component_mask = (labels == label_id).astype(np.uint8)
-                components.append(component_mask)
-                metadata.append({
-                    'source': source_name,
-                    'size': np.sum(component_mask),
-                    'label_id': label_id
-                })
+                component_size = np.sum(component_mask)
+                
+                # Filter out small components
+                if component_size >= min_component_size:
+                    all_components.append(component_mask)
+                    component_metadata.append({
+                        'source': source_name,
+                        'size': component_size,
+                        'original_label': label_id
+                    })
     
-    # Convert back to torch tensors
-    if len(components) == 0:
-        # No components found - return empty tensor
-        result = torch.zeros((max_channels, *mask1.shape), dtype=torch.float32, device=mask1.device)
-        return result, []
-    
-    # Convert components to torch tensors
-    torch_components = []
-    for comp in components:
-        torch_comp = torch.from_numpy(comp).float().to(mask1.device)
-        torch_components.append(torch_comp)
-    
-    # Randomly shuffle the components - this is key for preventing ordering bias
-    combined_data = list(zip(torch_components, metadata))
+    # Handle edge case: no components found
+    if len(all_components) == 0:
+        if return_sdf:
+            # Return SDF of empty masks (all positive values)
+            empty_sdf = np.ones((H, W), dtype=np.float32) * np.sqrt(H*H + W*W)
+            empty_tensor = torch.from_numpy(empty_sdf).to(original_device).float()
+            if len(original_shape1) != len(empty_tensor.shape):
+                empty_tensor = empty_tensor.view(original_shape1)
+            return empty_tensor, empty_tensor
+        else:
+            empty_mask = torch.zeros_like(mask1)
+            return empty_mask, empty_mask,
+    # Shuffle components if requested
     if shuffle:
+        combined_data = list(zip(all_components, component_metadata))
         random.shuffle(combined_data)
-    torch_components, metadata = zip(*combined_data)
+        all_components, component_metadata = zip(*combined_data)
+        all_components = list(all_components)
+        component_metadata = list(component_metadata)
     
-    # Create output tensor with padding
-    result = torch.zeros((max_channels, *mask1.shape), dtype=torch.float32, device=mask1.device)
+    # Redistribute components into two masks
+    # Strategy: alternate assignment or use more sophisticated distribution
+    new_mask1 = np.zeros((H, W), dtype=np.uint8)
+    new_mask2 = np.zeros((H, W), dtype=np.uint8)
     
-    # Fill channels with components (up to max_channels)
-    num_components = min(len(torch_components), max_channels)
-    for i in range(num_components):
-        result[i] = torch_components[i]
+    redistribution_info = []
     
-    # Update metadata with final channel assignments
-    final_metadata = []
-    for i in range(num_components):
-        meta = dict(metadata[i])  # Copy metadata
-        meta['final_channel'] = i
-        final_metadata.append(meta)
+    # Alternate assignment for balanced distribution
+    for i, (component, metadata) in enumerate(zip(all_components, component_metadata)):
+        if i % 2 == 0:
+            new_mask1 |= component
+            assigned_to = 'mask1'
+        else:
+            new_mask2 |= component
+            assigned_to = 'mask2'
+        
+        redistribution_info.append({
+            'component_id': i,
+            'assigned_to': assigned_to,
+            'original_source': metadata['source'],
+            'size': metadata['size']
+        })
     
-    # Add info about unused components if any
-    if len(torch_components) > max_channels:
-        print(f"Warning: Found {len(torch_components)} components but only using {max_channels} channels. "
-              f"{len(torch_components) - max_channels} components were dropped.")
+    # Convert to SDF if requested, otherwise keep as binary masks
+    if return_sdf:
+        sdf1 = compute_sdf(new_mask1)
+        sdf2 = compute_sdf(new_mask2)
+        
+        # Convert to torch tensors
+        result_mask1 = torch.from_numpy(sdf1).to(original_device).float()
+        result_mask2 = torch.from_numpy(sdf2).to(original_device).float()
+    else:
+        # Convert back to torch tensors with original dtype
+        result_mask1 = torch.from_numpy(new_mask1).to(original_device).to(original_dtype)
+        result_mask2 = torch.from_numpy(new_mask2).to(original_device).to(original_dtype)
     
-    return result, final_metadata
+    # Restore original shape if it was different (e.g., (1, H, W) -> (H, W) -> (1, H, W))
+    if len(original_shape1) != len(result_mask1.shape):
+        result_mask1 = result_mask1.view(original_shape1)
+        result_mask2 = result_mask2.view(original_shape2)
+    
+    return result_mask1, result_mask2
 
-def batch_extract_components(batch_mask1, batch_mask2, max_channels=512, shuffle=True):
+
+def build_origin_mask(mask1, mask2, mask1_label=1, mask2_label=2, intersection_label=3):
     """
-    Process a batch of mask pairs efficiently.
+    Create a union of two binary masks with different labels for different regions.
     
     Args:
-        batch_mask1 (torch.Tensor): Batch of first masks, shape (B, H, W) or (B, 1, H, W)
-        batch_mask2 (torch.Tensor): Batch of second masks, shape (B, H, W) or (B, 1, H, W)
-        max_channels (int): Maximum number of channels in output tensor
-        use_opencv (bool): Whether to use OpenCV for connected components
+        mask1 (torch.Tensor): First binary mask (0s and 1s)
+        mask2 (torch.Tensor): Second binary mask (0s and 1s)
+        mask1_label (int): Label for pixels only in mask1 (default: 1)
+        mask2_label (int): Label for pixels only in mask2 (default: 2)
+        intersection_label (int): Label for pixels in both masks (default: 3)
     
     Returns:
-        torch.Tensor: Shape (B, max_channels, H, W)
-        list: List of metadata dictionaries for each batch item
+        torch.Tensor: Combined mask with labels:
+                     - 0: background (not in either mask)
+                     - mask1_label: only in mask1
+                     - mask2_label: only in mask2
+                     - intersection_label: in both masks
     """
-    batch_size = batch_mask1.shape[0]
+    # Ensure masks are boolean or convert to boolean
+    mask1_bool = mask1.bool()
+    mask2_bool = mask2.bool()
     
-    # Get the spatial dimensions
-    if len(batch_mask1.shape) == 4:  # (B, C, H, W)
-        _, _, H, W = batch_mask1.shape
-    else:  # (B, H, W)
-        _, H, W = batch_mask1.shape
+    # Create output tensor initialized to 0 (background)
+    result = torch.zeros_like(mask1_bool, dtype=torch.int,device=mask1.device)
     
-    # Initialize output tensor
-    batch_result = torch.zeros((batch_size, max_channels, H, W), 
-                              dtype=torch.float32, device=batch_mask1.device)
-    batch_metadata = []
+    # Set regions: order matters for overlapping regions
+    result[mask1_bool] = mask1_label                    # Only mask1
+    result[mask2_bool] = mask2_label                    # Only mask2 (overwrites mask1 where they overlap)
+    result[mask1_bool & mask2_bool] = intersection_label # Both masks (intersection)
     
-    # Process each item in the batch
-    for i in range(batch_size):
-        mask1 = batch_mask1[i]
-        mask2 = batch_mask2[i]
-        
-        result, metadata = extract_connected_components_fast(
-            mask1, mask2, max_channels, shuffle
-        )
-        
-        batch_result[i] = result
-        batch_metadata.append(metadata)
-    
-    return batch_result
-
+    return result
 def build_origin_mask(mask1, mask2, mask1_label=1, mask2_label=2, intersection_label=3):
     """
     Create a union of two binary masks with different labels for different regions.
@@ -1059,3 +1105,19 @@ def build_origin_mask(mask1, mask2, mask1_label=1, mask2_label=2, intersection_l
     result[intersection & ~random_choices] = mask2_label
     
     return result
+
+def dice_loss(pred, target, smooth=1.):
+    """
+    pred: logits (B, C, H, W)
+    target: ground truth labels (B, H, W)
+    """
+    num_classes = pred.shape[1]
+    pred = F.softmax(pred, dim=1)
+    target_one_hot = F.one_hot(target, num_classes=num_classes).permute(0, 3, 1, 2).float()
+
+    intersection = (pred * target_one_hot).sum(dim=(0, 2, 3))
+    union = pred.sum(dim=(0, 2, 3)) + target_one_hot.sum(dim=(0, 2, 3))
+
+    dice = (2. * intersection + smooth) / (union + smooth)
+    loss = 1 - dice.mean()
+    return loss
