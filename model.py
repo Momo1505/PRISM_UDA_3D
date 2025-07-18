@@ -430,4 +430,4 @@ class UNet(nn.Module):
 
         pl_logits = self.outc1(u41)
 
-        return sam_logits,pl_logits
+        return  torch.tanh(sam_logits), torch.tanh(pl_logits)
