@@ -39,7 +39,7 @@ from mmseg.models.utils.dacs_transforms import (denorm, get_class_masks,
 from mmseg.models.utils.visualization import prepare_debug_out, subplotimg
 from mmseg.utils.utils import downscale_label_ratio
 from plot import save_segmentation_map
-#from mmseg.models.segmentors.base import UNet
+from mmseg.models.segmentors.base import UNet
 import torch.nn as nn
 from matplotlib.colors import ListedColormap
 from mmseg.datasets import CityscapesDataset
@@ -54,7 +54,7 @@ from PIL import Image
 from torchvision import transforms
 from torch.utils.tensorboard import SummaryWriter
 import cv2
-from model import UNet
+#from model import UNet
 from scipy.ndimage import distance_transform_edt
 
 def _params_equal(ema_model, model):
@@ -118,8 +118,8 @@ class DACS(UDADecorator):
             self.imnet_model = None
 
         #Adding for our training
-        # self.network = None
-        # self.optimizer = None
+        self.network = None
+        self.optimizer = None
         self.masked_loss_list = []
         self.refin_loss_list = []
 
@@ -249,44 +249,38 @@ class DACS(UDADecorator):
         # Return True if sliding mean has decreased
         return second_half_mean < first_half_mean
     
-    # def train_refinement_source(self, pl_source, sam_source, gt_source, network, optimizer, device,class_weight): #ADDED
-    #     if network is None : #Initialization du réseau et tutti quanti
-    #         #network = UNet() #For binary
-    #         #network = UNet(n_classes=19) #For multilabel
-    #         network = EncodeDecode("cpu")
-    #         network = network.to(device)
-    #         optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
-
-    #     pl_source = pl_source.unsqueeze(1)
-    #     # resizing the tensors
-    #     gt_source = F.interpolate(gt_source.to(torch.float),size=(256,256),mode='nearest')
-    #     sam_source = F.interpolate(sam_source.to(torch.float),size=(256,256),mode='nearest')
-    #     pl_source = F.interpolate(pl_source.to(torch.float),size=(256,256),mode='nearest')
-    #     mask_1,mask_2 =  extract_mix_redistribute_components(pl_source.to(torch.int) , sam_source.to(torch.int))
-
-    #     network.train()
-    #     ce_loss = nn.CrossEntropyLoss(ignore_index=255) #For multilabel
+    def train_refinement_source(self, pl_source, sam_source, gt_source, network, optimizer, device): #ADDED
+        if network is None : #Initialization du réseau et tutti quanti
+            network = UNet(n_classes=2) #For binary
+            #network = UNet(n_classes=3) #For multilabel
+            network = network.to(device)
+            optimizer = torch.optim.Adam(params=network.parameters(), lr=0.0001)
         
-    #     pl_preds = network(mask_1.to(torch.float),mask_2.to(torch.float)) 
-    #     dice = dice_loss(pl_preds, gt_source.squeeze(1).to(torch.long))
-    #     loss = ce_loss(pl_preds, gt_source.to(torch.long).squeeze(1)) + dice
-    #     print("pred_shape", pl_preds.shape, "pred_unique", np.unique(pl_preds.detach().cpu().numpy()))
-    #     print("gt_source_shape", gt_source.shape, "gt_source_unique", np.unique(gt_source.detach().cpu().numpy()))
+        network.train()
+        #ce_loss = torch.nn.BCEWithLogitsLoss() #uncomment for binary
+        ce_loss = torch.nn.CrossEntropyLoss() #For multilabel
+        pl_source = pl_source.unsqueeze(1)
+        
+        pred = network(pl_source, sam_source)
+        print("pred_shape", pred.shape, "pred_unique", np.unique(pred.detach().cpu().numpy()))
+        print("gt_source_shape", gt_source.shape, "gt_source_unique", np.unique(gt_source.detach().cpu().numpy()))
+        #loss = ce_loss(pred, gt_source.float()) #uncomment for binary
+        loss = ce_loss(pred, gt_source.squeeze(1).long()) #for multilabel
+        optimizer.zero_grad()
+        loss.backward()
+        self.refin_loss_list.append(loss.item())
+        optimizer.step()
+        self.plot_loss_evolution(self.refin_loss_list,plot_name="refin_loss.png")
 
-    #     optimizer.zero_grad()
-    #     loss.backward()
-    #     self.refin_loss_list.append(loss.item())
-    #     optimizer.step()
-    #     self.plot_loss_evolution(self.refin_loss_list,plot_name="refin_loss.png")
+        # logging the iou scores
+        pl = pred.argmax(dim=1).detach().cpu().squeeze().to(torch.long).numpy()
+        sam_source = sam_source.detach().cpu().squeeze().to(torch.long).numpy()
+        pl_source = pl_source.detach().cpu().squeeze().to(torch.long).numpy()
 
-    #     # logging the iou scores
-    #     pl = pl_preds.argmax(dim=1).detach().cpu().to(torch.long).numpy()
-    #     sam_source = sam_source.detach().cpu().to(torch.long).numpy()
-    #     pl_source = pl_source.detach().cpu().to(torch.long).numpy()
+        logging(self.writer,pl_source, sam_source, gt_source.detach().cpu().squeeze().long().numpy(),pl,self.local_iter)
+        
 
-    #     logging(self.writer,pl_source, sam_source, gt_source.detach().cpu().long().numpy(),pl,self.local_iter)
-
-    #     return network, optimizer
+        return network, optimizer
 
 
     def masked_feat_dist(self, f1, f2, mask=None):
@@ -597,84 +591,82 @@ class DACS(UDADecorator):
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
             #if (self.local_iter < 7500):
-            # if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter)) and (self.local_iter < 12500) :
-            #     self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev,gt_class_weights)
+            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter)) and (self.local_iter < 12500) :
+                self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev)
 
             #if (self.local_iter < 7500):
             if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter):
                 with torch.no_grad():
+                    self.network.eval()
                     pseudo_label = pseudo_label.unsqueeze(1)
                     ema = pseudo_label.clone().detach().cpu()
-            
-                    #concat = torch.cat((pseudo_label, target_sam), dim=1).float()
-                    pseudo_label_ref = random_fusion(pseudo_label.to(torch.float),target_sam.to(torch.float)) 
+        
+                    pseudo_label_ref = self.network(pseudo_label, target_sam)
                     pseudo_label = pseudo_label.squeeze(1)
 
-                    #softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label_ref2 = return_mask(pseudo_label_ref).to(torch.float)
+                    softmax = torch.nn.Softmax(dim=1)
+                    pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
 
                     #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
                     #plt.show()
                     #print("unique value", np.unique(pseudo_label.cpu().numpy()))
                     #print("shape", np.shape(pseudo_label_ref.cpu().numpy()))
 
-                for j in range(batch_size):
-                    rows, cols = 1, 5  # Increase cols to 4 for the new plot
-                    fig, axs = plt.subplots(
-                        rows,
-                        cols,
-                        figsize=(3 * cols, 3 * rows),
-                        gridspec_kw={
-                            'hspace': 0.1,
-                            'wspace': 0.05,
-                            'top': 0.95,
-                            'bottom': 0.05,
-                            'right': 0.95,
-                            'left': 0.05
-                        },
-                    )
+                    for j in range(batch_size):
+                        rows, cols = 1, 5  # Increase cols to 4 for the new plot
+                        fig, axs = plt.subplots(
+                            rows,
+                            cols,
+                            figsize=(3 * cols, 3 * rows),
+                            gridspec_kw={
+                                'hspace': 0.1,
+                                'wspace': 0.05,
+                                'top': 0.95,
+                                'bottom': 0.05,
+                                'right': 0.95,
+                                'left': 0.05
+                            },
+                        )
 
-                    # Plot the images
-                    axs[0].imshow(target_img[j].cpu().numpy().astype(np.float32)[0, :, :])
-                    axs[0].set_title('Target Image')
+                        # Plot the images
+                        axs[0].imshow(target_img[j].cpu().numpy()[0, :, :])
+                        axs[0].set_title('Target Image')
 
-                    subplotimg(axs[1],pseudo_label[j].cpu().numpy().astype(np.float32)[:, :],'Pseudo Label')
-                    #axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap=cityscapes_cmap)
-                    #axs[1].set_title('Pseudo Label')
+                        axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap='gray')
+                        axs[1].set_title('Pseudo Label')
 
-                    axs[2].imshow(target_sam[j].cpu().numpy().astype(np.float32)[0, :, :], cmap='gray')
-                    axs[2].set_title('Target SAM')
+                        axs[2].imshow(target_sam[j].cpu().numpy()[0, :, :], cmap='gray')
+                        axs[2].set_title('Target SAM')
 
-                    axs[3].imshow(pseudo_label_ref[j].cpu().numpy().astype(np.float32)[0, :, :], cmap='gray')  # New plot
-                    axs[3].set_title('Pseudo Label Ref')
+                        axs[3].imshow(pseudo_label_ref[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
+                        axs[3].set_title('Pseudo Label Ref')
 
-                    subplotimg(axs[4],pseudo_label_ref2[j].cpu().numpy().astype(np.float32)[:, :],'pl_after_post')
-                    # axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap=cityscapes_cmap)  # New plot
-                    # axs[4].set_title('pl_after_post')
+                        axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
+                        axs[4].set_title('pl_after_post')
 
-                    # Turn off axis for all subplots
-                    for ax in axs.flat:
-                        ax.axis('off')
+                        # Turn off axis for all subplots
+                        for ax in axs.flat:
+                            ax.axis('off')
 
-                    # Save the figure
-                    out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
-                    os.makedirs(out_dir, exist_ok=True)
-                    plt.savefig(
-                        os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
-                    )
-                    plt.close()
+                        # Save the figure
+                        out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+                        os.makedirs(out_dir, exist_ok=True)
+                        plt.savefig(
+                            os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
+                        )
+                        plt.close()
 
                     #For binary segmentation
                     #target_sam = target_sam.squeeze(1)  # Removes the singleton dimension
                     #pseudo_label = (pseudo_label_ref.squeeze(1)>0.5).long()
                     
                     #For multilabel segmentation
-                    #softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label = return_mask(pseudo_label_ref).to(torch.long)
-                    save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy().astype(np.float32), os.path.join(out_dir,
-                                        f'{(self.local_iter + 1):06d}_pl_raffiné.png'))
+                    softmax = torch.nn.Softmax(dim=1)
+                    pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
 
                     #Let it uncommented for both
+                    pseudo_label = pseudo_label.squeeze(1)
+
                     pl = pseudo_label.clone().detach().cpu()
                     #print("pseudo_label shape",pseudo_label.shape)
                     #pseudo_label = F.interpolate(pseudo_label.unsqueeze(1),size=(1024,1024),mode='nearest').to(torch.long)
@@ -683,10 +675,11 @@ class DACS(UDADecorator):
                     # target gt
                     target_file_name = target_img_metas[0]["filename"].replace("images","labels")
                     img_target = Image.open(target_file_name ).convert("P")
-                    target_gt = np.array(self.transform(img_target))
-                    target_sam = F.interpolate(target_sam.float(),size=(256,256),mode='nearest').long().detach().cpu().numpy()
-                    ema = F.interpolate(ema.float(),size=(256,256),mode='nearest').long().cpu().numpy()
-                    pl = F.interpolate(pl.float(),size=(256,256),mode='nearest').long().cpu()
+                    target_gt = torch.from_numpy(np.array(self.transform(img_target))).unsqueeze(0).unsqueeze(0)
+                    target_gt = F.interpolate(target_gt,size=(1024,1024),mode='nearest').to(torch.long).squeeze().numpy()
+                    target_sam = target_sam.squeeze().long().detach().cpu().numpy()
+                    ema = ema.squeeze().long().cpu().numpy()
+                    pl = pl.squeeze().long().cpu()
                     logging(self.writer,ema, target_sam, target_gt,pl.long().numpy(),self.local_iter,False)
                     del ema,pl
                 
@@ -868,7 +861,7 @@ def logging(writer,pl_source, sam_source, gt_source,pl_pred,iteration,is_train=T
 
 def random_fusion(pl_source,sam_source):
     alpha = torch.rand_like(pl_source,device=pl_source.device)
-    return alpha * pl_source + (1-alpha) * sam_source
+    return alpha * pl_source #+ (1-alpha) * sam_source
 
 def return_mask(logits):
     return (logits >=0.5)
