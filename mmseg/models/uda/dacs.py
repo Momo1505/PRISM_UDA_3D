@@ -76,6 +76,8 @@ def calc_grad_magnitude(grads, norm_type=2.0):
 
     return norm
 
+train_log_buffer = []  # global or passed around
+test_log_buffer = []  # global or passed around
 
 @UDA.register_module()
 class DACS(UDADecorator):
@@ -130,8 +132,6 @@ class DACS(UDADecorator):
 
         # defining dataframe for logging
         self.transform = transforms.Resize((256,256))
-
-        self.writer = SummaryWriter(log_dir=self.train_cfg['work_dir'])
 
         with open(f"data/{self.source}/sample_class_stats_dict.json","r") as of:
             self.sample_class_dict = json.load(of)
@@ -258,7 +258,7 @@ class DACS(UDADecorator):
         
         network.train()
         #ce_loss = torch.nn.BCEWithLogitsLoss() #uncomment for binary
-        ce_loss = torch.nn.CrossEntropyLoss() #For multilabel
+        ce_loss = torch.nn.CrossEntropyLoss(ignore_index=255) #For multilabel
         pl_source = pl_source.unsqueeze(1)
         
         pred = network(pl_source, sam_source)
@@ -277,7 +277,7 @@ class DACS(UDADecorator):
         sam_source = sam_source.detach().cpu().squeeze().to(torch.long).numpy()
         pl_source = pl_source.detach().cpu().squeeze().to(torch.long).numpy()
 
-        logging(self.writer,pl_source, sam_source, gt_source.detach().cpu().squeeze().long().numpy(),pl,self.local_iter)
+        logging(pl_source, sam_source, gt_source.detach().cpu().squeeze().long().numpy(),pl,self.local_iter,self.train_cfg['work_dir'])
         
 
         return network, optimizer
@@ -680,7 +680,7 @@ class DACS(UDADecorator):
                     target_sam = target_sam.squeeze().long().detach().cpu().numpy()
                     ema = ema.squeeze().long().cpu().numpy()
                     pl = pl.squeeze().long().cpu()
-                    logging(self.writer,ema, target_sam, target_gt,pl.long().numpy(),self.local_iter,False)
+                    logging(ema, target_sam, target_gt,pl.long().numpy(),self.local_iter,self.train_cfg['work_dir'],False)
                     del ema,pl
                 
 
@@ -840,28 +840,33 @@ class DACS(UDADecorator):
         return log_vars
     
 
-def logging(writer,pl_source, sam_source, gt_source,pl_pred,iteration,is_train=True):
 
-    prefix = "Source" if is_train else "Target"
 
-    ema_vs_gt, _ = calculate_iou_and_dice(pl_source, gt_source)
-    sam_vs_gt, _ = calculate_iou_and_dice(sam_source, gt_source)
-    pl_vs_gt,  _ = calculate_iou_and_dice(pl_pred,   gt_source)
-    ema_vs_pl, _ = calculate_iou_and_dice(pl_source, pl_pred)
-    sam_vs_pl, _ = calculate_iou_and_dice(sam_source, pl_pred)
+def logging(pl_source, sam_source, gt_source, pl, iteration,out_dir, is_train=True, save_every=50):
+    # Compute metrics
+    ema_vs_gt,_ = calculate_iou_and_dice(pl_source,gt_source)
+    sam_vs_gt,_ = calculate_iou_and_dice(sam_source,gt_source)
+    pl_vs_gt,_ = calculate_iou_and_dice(pl,gt_source)
+    ema_vs_pl,_ = calculate_iou_and_dice(pl_source,pl)
+    sam_vs_pl,_ = calculate_iou_and_dice(sam_source,pl)
 
-    # Log scalar IoUs to TensorBoard
-    writer.add_scalar(f"{prefix}/IoU_EMA_vs_GT", ema_vs_gt, iteration)
-    writer.add_scalar(f"{prefix}/IoU_SAM_vs_GT", sam_vs_gt, iteration)
-    writer.add_scalar(f"{prefix}/IoU_PL_vs_GT", pl_vs_gt, iteration)
-    writer.add_scalar(f"{prefix}/IoU_EMA_vs_PL", ema_vs_pl, iteration)
-    writer.add_scalar(f"{prefix}/IoU_SAM_vs_PL", sam_vs_pl, iteration)
+    log_buffer = train_log_buffer if is_train else test_log_buffer
 
-    writer.flush()
+    # Append to buffer
+    log_buffer.append({
+        "iteration": iteration,
+        "ema_vs_gt": ema_vs_gt,
+        "sam_vs_gt": sam_vs_gt,
+        "pl_vs_gt": pl_vs_gt,
+        "ema_vs_pl": ema_vs_pl,
+        "sam_vs_pl": sam_vs_pl
+    })
 
-def random_fusion(pl_source,sam_source):
-    alpha = torch.rand_like(pl_source,device=pl_source.device)
-    return alpha * pl_source #+ (1-alpha) * sam_source
+    # Save periodically
+    if iteration % save_every == 0:
+        df = pd.DataFrame(log_buffer)
+        csv_path = "./train_iou_log_final.csv" if is_train else "./test_iou_log_final.csv"
+        save_dir = os.path.join(out_dir, csv_path)
 
-def return_mask(logits):
-    return (logits >=0.5)
+        df.to_csv(save_dir, index=False)
+
