@@ -545,8 +545,6 @@ class DACS(UDADecorator):
             del ema_logits
             out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
             os.makedirs(out_dir, exist_ok=True)
-            save_segmentation_map(pseudo_label.squeeze().detach().cpu().numpy(), os.path.join(out_dir,
-                                     f'{(self.local_iter + 1):06d}_ema.png'))
 
             pseudo_weight = self.filter_valid_pseudo_region(
                 pseudo_weight, valid_pseudo_mask)
@@ -559,13 +557,19 @@ class DACS(UDADecorator):
                     m.training = False
                 if isinstance(m, DropPath):
                     m.training = False
+            noise = torch.randn_like(img,device=img.device,requires_grad=False)
             ema_logits_source = self.get_ema_model().generate_pseudo_label(
-                img, img_metas)
+                img + noise, img_metas)
             seg_debug['Source'] = self.get_ema_model().debug_output
 
             pseudo_label_source, pseudo_weight_source = self.get_pseudo_label_and_weight(
                 ema_logits_source)
-            del ema_logits_source
+            del ema_logits_source, noise
+
+            save_segmentation_map(pseudo_label_source.squeeze().detach().cpu().numpy(),
+                                  sam_pseudo_label.squeeze().detach().cpu().numpy(), 
+                                  os.path.join(out_dir,
+                                     f'{(self.local_iter + 1):06d}_ema_sam_source.png'))
 
             #pseudo_weight = self.filter_valid_pseudo_region(
             #    pseudo_weight, valid_pseudo_mask)
