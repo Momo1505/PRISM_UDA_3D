@@ -77,4 +77,4 @@ def plot_surface_dist(dataset:list):
     min_zoom = np.sqrt(256*256 / max_area)
     max_zoom = np.sqrt(256*256 / min_area)
 
-    print(f"Suggested zoom interval: [{min_zoom:.2f}, {max_zoom:.2f}]")
+    
