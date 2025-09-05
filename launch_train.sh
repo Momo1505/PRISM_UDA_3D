@@ -1,12 +1,11 @@
 #!/bin/bash
 
-sbatch slurm_scripts/WeiHtoI3_mic_hrda.slurm
-sbatch slurm_scripts/LW4toI3_mic_hrda.slurm
-sbatch slurm_scripts/I3toLW4_mic_hrda.slurm
-sbatch slurm_scripts/WeiHtoLW4_mic_hrda.slurm
-sbatch slurm_scripts/kvasirtoCVC_mic_hrda.slurm
-sbatch slurm_scripts/flairtot2_mic_hrda.slurm
-sbatch slurm_scripts/t2toflair_mic_hrda.slurm
-sbatch slurm_scripts/I3toWeiH_mic_hrda.slurm
-sbatch slurm_scripts/CVCtokvasir_mic_hrda.slurm
-sbatch slurm_scripts/LW4toWeiH_mic_hrda.slurm
+sbatch slurm_scripts/I3toLW4_mic_hrda_noise_6.slurm
+sbatch slurm_scripts/I3toLW4_mic_hrda_noise_3.slurm
+
+sbatch slurm_scripts/I3toLW4_mic_hrda_noise_5.slurm
+
+sbatch slurm_scripts/I3toLW4_mic_hrda_noise_20.slurm
+
+sbatch slurm_scripts/I3toLW4_mic_hrda_noise_4.slurm
+

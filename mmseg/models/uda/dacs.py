@@ -128,7 +128,7 @@ class DACS(UDADecorator):
         # getting the type of refinement
         #self.attention_type = cfg["attention_type"]
         self.source = cfg["source"]
-        self.scaler = GradScaler()
+        self.noise = cfg["noise"]
 
         # defining dataframe for logging
         self.transform = transforms.Resize((256,256))
@@ -278,6 +278,15 @@ class DACS(UDADecorator):
         pl_source = pl_source.detach().cpu().squeeze().to(torch.long).numpy()
 
         logging(pl_source, sam_source, gt_source.detach().cpu().squeeze().long().numpy(),pl,self.local_iter,self.train_cfg['work_dir'])
+
+        out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+        os.makedirs(out_dir, exist_ok=True)
+
+        save_segmentation_map(pl_source,
+                                  sam_source,
+                                  pl, 
+                                  os.path.join(out_dir,
+                                     f'{(self.local_iter + 1):06d}_ema_sam_source.png'))
         
 
         return network, optimizer
@@ -557,7 +566,8 @@ class DACS(UDADecorator):
                     m.training = False
                 if isinstance(m, DropPath):
                     m.training = False
-            noise = torch.randn_like(img,device=img.device,requires_grad=False)
+
+            noise = (self.noise ** 0.5) * torch.randn_like(img,device=img.device,requires_grad=False)
             ema_logits_source = self.get_ema_model().generate_pseudo_label(
                 img + noise, img_metas)
             seg_debug['Source'] = self.get_ema_model().debug_output
@@ -566,10 +576,6 @@ class DACS(UDADecorator):
                 ema_logits_source)
             del ema_logits_source, noise
 
-            save_segmentation_map(pseudo_label_source.squeeze().detach().cpu().numpy(),
-                                  sam_pseudo_label.squeeze().detach().cpu().numpy(), 
-                                  os.path.join(out_dir,
-                                     f'{(self.local_iter + 1):06d}_ema_sam_source.png'))
 
             #pseudo_weight = self.filter_valid_pseudo_region(
             #    pseudo_weight, valid_pseudo_mask)
@@ -594,12 +600,12 @@ class DACS(UDADecorator):
             #classes = torch.unique(gt_semantic_seg)
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
-            #if (self.local_iter < 7500):
-            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter)) and (self.local_iter < 12500) :
+            if (self.local_iter < 7500):
+            #if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter)) and (self.local_iter < 12500) :
                 self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev)
 
-            #if (self.local_iter < 7500):
-            if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter):
+            if (self.local_iter < 7500):
+            #if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter):
                 with torch.no_grad():
                     self.network.eval()
                     pseudo_label = pseudo_label.unsqueeze(1)
