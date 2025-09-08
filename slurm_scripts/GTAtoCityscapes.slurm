@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH -p grantgpu -A g2025a412g
 #SBATCH -N 1
+#SBATCH --gres=gpu:1
 #SBATCH --mem=16G
 #SBATCH --constraint="gpua100"
 #SBATCH --mail-user="mouhamed.sow@unistra.fr"
