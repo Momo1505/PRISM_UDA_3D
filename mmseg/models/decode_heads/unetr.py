@@ -295,7 +295,6 @@ class UNETR(nn.Module):
 
     def forward(self, x):
         # Calculate patch dimensions based on actual input size
-        print("x shape", x.shape)
         batch_size, channels, orig_depth, orig_height, orig_width = x.shape
         self.patch_dim = [orig_depth // self.patch_size, orig_height // self.patch_size, orig_width // self.patch_size]
         

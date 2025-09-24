@@ -742,12 +742,16 @@ class DACS(UDADecorator):
                 _, mixed_seg_weight[i] = strong_transform(
                     strong_parameters,
                     target=torch.stack((gt_pixel_weight[i], pseudo_weight[i])))
+                
+            print("pseudo_weight in dacs unique",pseudo_weight.unique())
+            print("pseudo_label in dacs unique",pseudo_label.unique())
+            print("gt_pixel_weight in dacs unique",gt_pixel_weight.unique())
             del gt_pixel_weight
             mixed_img = torch.cat(mixed_img)
             mixed_lbl = torch.cat(mixed_lbl)
+            print("mixed_lbl in dacs unique",mixed_lbl.unique())
 
-            print("pseudo_weight in dacs",pseudo_weight.shape)
-            print("mixed_img",mixed_img.shape)
+            
 
             # Train on mixed images
             mix_losses = self.get_model().forward_train(
