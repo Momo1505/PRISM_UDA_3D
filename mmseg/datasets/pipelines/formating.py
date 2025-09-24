@@ -189,6 +189,9 @@ class DefaultFormatBundle(object):
                        (3)to DataContainer (stack=True)
     """
 
+    def __init__(self,from_3d=False):
+        self.from_3d=from_3d
+
     def __call__(self, results):
         """Call function to transform and format common fields in results.
 
@@ -202,9 +205,14 @@ class DefaultFormatBundle(object):
 
         if 'img' in results:
             img = results['img']
-            if len(img.shape) < 3:
-                img = np.expand_dims(img, -1)
-            img = np.ascontiguousarray(img.transpose(2, 0, 1))
+            if self.from_3d:
+                if len(img.shape) < 4 : # (D,H,W)
+                    img = img[None] # (C,D,H,W)
+                img = np.ascontiguousarray(img)
+            else:
+                if len(img.shape) < 3:
+                    img = np.expand_dims(img, -1) #(H,W,C)
+                img = np.ascontiguousarray(img.transpose(2, 0, 1)) #(C,H,W)
             results['img'] = DC(to_tensor(img), stack=True)
         if 'gt_semantic_seg' in results:
             # convert to long

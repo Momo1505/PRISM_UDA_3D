@@ -7,6 +7,8 @@ from mmcv.utils import deprecated_api_warning, is_tuple_of
 from numpy import random
 
 from ..builder import PIPELINES
+import torch
+import torch.nn.functional as F
 
 
 @PIPELINES.register_module()
@@ -49,7 +51,8 @@ class Resize(object):
                  multiscale_mode='range',
                  ratio_range=None,
                  keep_ratio=True,
-                 override_scale=False):
+                 override_scale=False,
+                 from_3d=False):
         if img_scale is None:
             self.img_scale = None
         else:
@@ -71,6 +74,7 @@ class Resize(object):
         self.ratio_range = ratio_range
         self.keep_ratio = keep_ratio
         self.override_scale = override_scale
+        self.from_3d = from_3d
 
     @staticmethod
     def random_select(img_scales):
@@ -205,25 +209,22 @@ class Resize(object):
         results['keep_ratio'] = self.keep_ratio
     
     def _resize_img_3d(self, results):
-        """Resize images with ``results['scale']``."""
-        if self.keep_ratio:
-            img, scale_factor = mmcv.imrescale(
-                results['img'], results['scale'], return_scale=True)
-            # the w_scale and h_scale has minor difference
-            # a real fix should be done in the mmcv.imrescale in the future
-            new_h, new_w = img.shape[:2]
-            h, w = results['img'].shape[:2]
-            w_scale = new_w / w
-            h_scale = new_h / h
-        else:
-            img, w_scale, h_scale = mmcv.imresize(
-                results['img'], results['scale'], return_scale=True)
-        scale_factor = np.array([w_scale, h_scale, w_scale, h_scale],
-                                dtype=np.float32)
-        results['img'] = img
-        results['img_shape'] = img.shape
-        results['pad_shape'] = img.shape  # in case that there is no padding
-        results['scale_factor'] = scale_factor
+        img = results['img']  # (C,D,H,W)
+        C,D,H,W = img.shape
+        new_H, new_W = results['scale']
+        h_scale = new_H / H
+        w_scale = new_W / W
+        d_scale = 1.0  
+
+        img_tensor = torch.from_numpy(img).unsqueeze(0)  # (1,C,D,H,W)
+        img_resized = F.interpolate(img_tensor, scale_factor=(d_scale, h_scale, w_scale),
+                                    mode="trilinear", align_corners=False)
+        img_resized = img_resized.squeeze(0).numpy()  # (C,D,H,W)
+
+        results['img'] = img_resized.astype(np.float32)
+        results['img_shape'] = img_resized.shape
+        results['pad_shape'] = img_resized.shape
+        results['scale_factor'] = np.array([d_scale, h_scale, w_scale], dtype=np.float32)
         results['keep_ratio'] = self.keep_ratio
 
     def _resize_seg(self, results):
@@ -245,6 +246,39 @@ class Resize(object):
                 sam = mmcv.imresize(
                     results[key], results['scale'], interpolation='nearest')
             results[key] = sam
+    
+    def _resize_seg_3d(self, results):
+        for key in results.get('seg_fields', []):
+            seg = results[key]  # (D,H,W)
+            D,H,W = seg.shape
+            new_H, new_W = results['scale']
+            h_scale = new_H / H
+            w_scale = new_W / W
+            d_scale = 1.0
+
+            seg_tensor = torch.from_numpy(seg).unsqueeze(0).unsqueeze(0).float()  # (1,1,D,H,W)
+            seg_resized = F.interpolate(
+                seg_tensor,
+                scale_factor=(d_scale, h_scale, w_scale),
+                mode='nearest'
+            )
+            results[key] = seg_resized.squeeze(0).squeeze(0).numpy().astype(np.uint8)
+
+        for key in results.get('sam_fields', []):
+            sam = results[key]  # (D,H,W)
+            D,H,W = sam.shape
+            new_H, new_W = results['scale']
+            h_scale = new_H / H
+            w_scale = new_W / W
+            d_scale = 1.0
+
+            sam_tensor = torch.from_numpy(sam).unsqueeze(0).unsqueeze(0).float()  # (1,1,D,H,W)
+            sam_resized = F.interpolate(
+                sam_tensor,
+                scale_factor=(d_scale, h_scale, w_scale),
+                mode='nearest'
+            )
+            results[key] = sam_resized.squeeze(0).squeeze(0).numpy().astype(np.uint8)
 
     def __call__(self, results):
         """Call function to resize images, bounding boxes, masks, semantic
@@ -260,9 +294,13 @@ class Resize(object):
 
         if 'scale' not in results or self.override_scale:
             self._random_scale(results)
-        self._resize_img(results)
-        self._resize_seg(results) #Pseudo-labels are resized here
-        ## ADD HERE FOR PSEUDO-LABELS ##
+        if self.from_3d:
+            self._resize_img_3d(results)
+            self._resize_seg_3d(results) #Pseudo-labels are resized here
+        else:
+            self._resize_img(results)
+            self._resize_seg(results) #Pseudo-labels are resized here
+            ## ADD HERE FOR PSEUDO-LABELS ##
         return results
 
     def __repr__(self):
@@ -334,6 +372,56 @@ class RandomFlip(object):
     def __repr__(self):
         return self.__class__.__name__ + f'(prob={self.prob})'
 
+@PIPELINES.register_module()
+class RandomFlip3D(object):
+    def __init__(self, prob=0.5, ):
+        self.prob = prob
+        self.direction = random.choice(['horizontal', 'vertical', 'depth'])
+
+    def __call__(self, results):
+        flip = np.random.rand() < self.prob
+        results['flip'] = flip
+        results['flip_direction'] = self.direction
+        if not flip:
+            return results
+
+        axis_map = {
+            'horizontal': 3,  # W axis
+            'vertical': 2,    # H axis
+            'depth': 1        # D axis
+        }
+    
+        axis = axis_map[self.direction]
+
+        # Flip image
+        results['img'] = np.flip(results['img'], axis=axis).copy()
+
+
+
+        # Flip segmentation
+        for key in results.get('seg_fields', []):
+            results[key] = np.flip(results[key], axis=axis-1).copy() # axis - 1 because segfields.ndim=3 
+
+        # Flip pseudo-labels
+        for key in results.get('sam_fields', []):
+            results[key] = np.flip(results[key], axis=axis-1).copy()
+
+        return results
+
+def pad_3d(arr,target_size,pad_val,is_seg=False):
+    if is_seg:
+        D, H, W = arr.shape
+        y_pad = max(0, target_size[0] - H)
+        x_pad = max(0, target_size[1] - W)
+        pad_width = ((0,0), (0,y_pad), (0,x_pad))  # (D,H,W)
+    else:
+        C, D, H, W = arr.shape
+        y_pad = max(0, target_size[0] - H)
+        x_pad = max(0, target_size[1] - W)
+        pad_width = ((0,0), (0,0), (0,y_pad), (0,x_pad))  # (C,D,H,W)
+
+    return np.pad(arr, pad_width, constant_values=pad_val)
+
 
 @PIPELINES.register_module()
 class Pad(object):
@@ -355,20 +443,20 @@ class Pad(object):
                  size=None,
                  size_divisor=None,
                  pad_val=0,
-                 seg_pad_val=255):
+                 seg_pad_val=255,from_3d=False):
         self.size = size
         self.size_divisor = size_divisor
         self.pad_val = pad_val
         self.seg_pad_val = seg_pad_val
+        self.from_3d=from_3d
         # only one of size and size_divisor should be valid
         assert size is not None or size_divisor is not None
         assert size is None or size_divisor is None
-
+        
     def _pad_img(self, results):
         """Pad images according to ``self.size``."""
         if self.size is not None:
-            padded_img = mmcv.impad(
-                results['img'], shape=self.size, pad_val=self.pad_val)
+            padded_img = mmcv.impad(results['img'], shape=self.size, pad_val=self.pad_val) if not self.from_3d else pad_3d(results['img'],self.size,self.pad_val)
         elif self.size_divisor is not None:
             padded_img = mmcv.impad_to_multiple(
                 results['img'], self.size_divisor, pad_val=self.pad_val)
@@ -383,14 +471,14 @@ class Pad(object):
             results[key] = mmcv.impad(
                 results[key],
                 shape=results['pad_shape'][:2],
-                pad_val=self.seg_pad_val)
+                pad_val=self.seg_pad_val) if not self.from_3d else pad_3d(results[key],self.size,self.seg_pad_val,True)
         
         #ADD HERE FOR PSEUDO-LABELS 
         for key in results.get('sam_fields', []):
             results[key] = mmcv.impad(
                 results[key],
                 shape=results['pad_shape'][:2],
-                pad_val=self.seg_pad_val)
+                pad_val=self.seg_pad_val) if not self.from_3d else pad_3d(results[key],self.size,self.seg_pad_val,True)
 
     def __call__(self, results):
         """Call function to pad images, masks, semantic segmentation maps.
@@ -427,10 +515,11 @@ class Normalize(object):
             default is true.
     """
 
-    def __init__(self, mean, std, to_rgb=True):
-        self.mean = np.array(mean, dtype=np.float32)
-        self.std = np.array(std, dtype=np.float32)
+    def __init__(self, mean, std, to_rgb=True,from_3d=False):
+        self.mean = np.array(mean, dtype=np.float32) # (C)
+        self.std = np.array(std, dtype=np.float32) # (C)
         self.to_rgb = to_rgb
+        self.from_3d = from_3d
 
     def __call__(self, results):
         """Call function to normalize images.
@@ -442,11 +531,19 @@ class Normalize(object):
             dict: Normalized results, 'img_norm_cfg' key is added into
                 result dict.
         """
-
-        results['img'] = mmcv.imnormalize(results['img'], self.mean, self.std,
+        if self.from_3d:
+            assert results['img'].ndim == 4, f"Expected (C,D,H,W), got {results['img'].shape}"
+            mean = self.mean[:,None,None,None]
+            std = self.std[:,None,None,None]
+            results['img'] = (results['img'] - mean) / std
+            to_rgb = False
+        else:
+            results['img'] = mmcv.imnormalize(results['img'], self.mean, self.std,
                                           self.to_rgb)
+            to_rgb = self.to_rgb
+            
         results['img_norm_cfg'] = dict(
-            mean=self.mean, std=self.std, to_rgb=self.to_rgb)
+            mean=self.mean, std=self.std, to_rgb=to_rgb)
         return results
 
     def __repr__(self):
@@ -557,16 +654,21 @@ class RandomCrop(object):
             occupy.
     """
 
-    def __init__(self, crop_size, cat_max_ratio=1., ignore_index=255):
+    def __init__(self, crop_size, cat_max_ratio=1., ignore_index=255,from_3d=False):
         assert crop_size[0] > 0 and crop_size[1] > 0
         self.crop_size = crop_size
         self.cat_max_ratio = cat_max_ratio
         self.ignore_index = ignore_index
+        self.from_3d = from_3d
 
     def get_crop_bbox(self, img):
         """Randomly get a crop bounding box."""
-        margin_h = max(img.shape[0] - self.crop_size[0], 0)
-        margin_w = max(img.shape[1] - self.crop_size[1], 0)
+        if self.from_3d:
+            margin_h = max(img.shape[-2] - self.crop_size[0], 0) # img shape (C,D,H,W)
+            margin_w = max(img.shape[-1] - self.crop_size[1], 0)
+        else:
+            margin_h = max(img.shape[0] - self.crop_size[0], 0)
+            margin_w = max(img.shape[1] - self.crop_size[1], 0)
         offset_h = np.random.randint(0, margin_h + 1)
         offset_w = np.random.randint(0, margin_w + 1)
         crop_y1, crop_y2 = offset_h, offset_h + self.crop_size[0]
@@ -576,8 +678,22 @@ class RandomCrop(object):
 
     def crop(self, img, crop_bbox):
         """Crop from ``img``"""
-        crop_y1, crop_y2, crop_x1, crop_x2 = crop_bbox
-        img = img[crop_y1:crop_y2, crop_x1:crop_x2, ...]
+        if self.from_3d:
+            crop_y1, crop_y2, crop_x1, crop_x2 = crop_bbox
+            img = img[:,:,crop_y1:crop_y2, crop_x1:crop_x2] # shape (C,D,H,W)
+        else:
+            crop_y1, crop_y2, crop_x1, crop_x2 = crop_bbox
+            img = img[crop_y1:crop_y2, crop_x1:crop_x2, ...] # shape (H,W,C)
+        return img
+    
+    def crop_seg(self, img, crop_bbox):
+        """Crop from ``img``"""
+        if self.from_3d:
+            crop_y1, crop_y2, crop_x1, crop_x2 = crop_bbox
+            img = img[:,crop_y1:crop_y2, crop_x1:crop_x2] # shape (D,H,W)
+        else:
+            crop_y1, crop_y2, crop_x1, crop_x2 = crop_bbox
+            img = img[crop_y1:crop_y2, crop_x1:crop_x2, ...] # shape (H,W,C)
         return img
 
     def __call__(self, results):
@@ -596,7 +712,7 @@ class RandomCrop(object):
         if self.cat_max_ratio < 1.:
             # Repeat 10 times
             for _ in range(10):
-                seg_temp = self.crop(results['gt_semantic_seg'], crop_bbox)
+                seg_temp = self.crop_seg(results['gt_semantic_seg'], crop_bbox)
                 labels, cnt = np.unique(seg_temp, return_counts=True)
                 cnt = cnt[labels != self.ignore_index]
                 if len(cnt) > 1 and np.max(cnt) / np.sum(
@@ -612,11 +728,11 @@ class RandomCrop(object):
 
         # crop semantic seg
         for key in results.get('seg_fields', []):
-            results[key] = self.crop(results[key], crop_bbox)
+            results[key] = self.crop_seg(results[key], crop_bbox)
 
         ## ADD HERE for pseudo-label ##
         for key in results.get('sam_fields', []):
-            results[key] = self.crop(results[key], crop_bbox)
+            results[key] = self.crop_seg(results[key], crop_bbox)
 
         return results
 

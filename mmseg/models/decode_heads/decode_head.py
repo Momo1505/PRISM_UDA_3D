@@ -242,7 +242,7 @@ class BaseDecodeHead(BaseModule, metaclass=ABCMeta):
             seg_weight = self.sampler.sample(seg_logit, seg_label)
         seg_label = seg_label.squeeze(1)
 
-        self.loss_decode.debug = self.debug
+        self.loss_decode.debug = self.resizedebug
         loss['loss_seg'] = self.loss_decode(
             seg_logit,
             seg_label,

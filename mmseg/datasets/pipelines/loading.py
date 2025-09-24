@@ -6,6 +6,7 @@ import mmcv
 import numpy as np
 
 from ..builder import PIPELINES
+import tifffile,io
 
 
 @PIPELINES.register_module()
@@ -34,12 +35,13 @@ class LoadImageFromFile(object):
                  to_float32=False,
                  color_type='color',
                  file_client_args=dict(backend='disk'),
-                 imdecode_backend='cv2'):
+                 imdecode_backend='cv2',from_3d=False):
         self.to_float32 = to_float32
         self.color_type = color_type
         self.file_client_args = file_client_args.copy()
         self.file_client = None
         self.imdecode_backend = imdecode_backend
+        self.from_3d = from_3d
 
     def __call__(self, results):
         """Call functions to load image and get image meta information.
@@ -60,8 +62,17 @@ class LoadImageFromFile(object):
         else:
             filename = results['img_info']['filename']
         img_bytes = self.file_client.get(filename)
-        img = mmcv.imfrombytes(
-            img_bytes, flag=self.color_type, backend=self.imdecode_backend)
+
+        if self.from_3d:
+            with tifffile.TiffFile(io.BytesIO(img_bytes)) as tif:
+                img = tif.asarray().astype(np.float32)
+                img = img[None] # (C=1,D=40,H=256,W=256)
+
+        else:
+
+            img = mmcv.imfrombytes(
+                img_bytes, flag=self.color_type, backend=self.imdecode_backend)
+            
         if self.to_float32:
             img = img.astype(np.float32)
 
@@ -73,7 +84,12 @@ class LoadImageFromFile(object):
         # Set initial values for default meta_keys
         results['pad_shape'] = img.shape
         results['scale_factor'] = 1.0
-        num_channels = 1 if len(img.shape) < 3 else img.shape[2]
+
+        if self.from_3d:
+            num_channels = img.shape[0]  # 1
+        else:
+            num_channels = 1 if len(img.shape) < 3 else img.shape[2]
+            
         results['img_norm_cfg'] = dict(
             mean=np.zeros(num_channels, dtype=np.float32),
             std=np.ones(num_channels, dtype=np.float32),
@@ -106,11 +122,13 @@ class LoadAnnotations(object):
     def __init__(self,
                  reduce_zero_label=False,
                  file_client_args=dict(backend='disk'),
-                 imdecode_backend='pillow'):
+                 imdecode_backend='pillow',
+                 from_3d=False):
         self.reduce_zero_label = reduce_zero_label
         self.file_client_args = file_client_args.copy()
         self.file_client = None
         self.imdecode_backend = imdecode_backend
+        self.from_3d = from_3d
 
     def __call__(self, results):
         """Call function to load multiple types annotations.
@@ -132,9 +150,13 @@ class LoadAnnotations(object):
         else:
             filename = results['ann_info']['seg_map']
         img_bytes = self.file_client.get(filename)
-        gt_semantic_seg = mmcv.imfrombytes(
-            img_bytes, flag='unchanged',
-            backend=self.imdecode_backend).squeeze().astype(np.uint8)
+        if self.from_3d:
+            with tifffile.TiffFile(io.BytesIO(img_bytes)) as tif:
+                gt_semantic_seg = tif.asarray().squeeze().astype(np.uint8)
+        else:
+            gt_semantic_seg = mmcv.imfrombytes(
+                img_bytes, flag='unchanged',
+                backend=self.imdecode_backend).squeeze().astype(np.uint8)
         # modify if custom classes
         if results.get('label_map', None) is not None:
             for old_id, new_id in results['label_map'].items():
@@ -156,9 +178,15 @@ class LoadAnnotations(object):
         else:
             filename_pl = results['pseudo_label']
         img_bytes_pl = self.file_client.get(filename_pl)
-        sam_pseudo_label = mmcv.imfrombytes(
-            img_bytes_pl, flag='unchanged',
-            backend=self.imdecode_backend).squeeze().astype(np.uint8)
+
+        if self.from_3d:
+            with tifffile.TiffFile(io.BytesIO(img_bytes_pl)) as tif:
+                sam_pseudo_label = tif.asarray().squeeze().astype(np.uint8)
+        else:
+
+            sam_pseudo_label = mmcv.imfrombytes(
+                img_bytes_pl, flag='unchanged',
+                backend=self.imdecode_backend).squeeze().astype(np.uint8)
         # modify if custom classes (removed here....)
         #if results.get('label_map', None) is not None:
         #    for old_id, new_id in results['label_map'].items():

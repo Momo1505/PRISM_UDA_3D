@@ -56,6 +56,7 @@ from torch.utils.tensorboard import SummaryWriter
 import cv2
 #from model import UNet
 from scipy.ndimage import distance_transform_edt
+import tifffile as tiff
 
 def _params_equal(ema_model, model):
     for ema_param, param in zip(ema_model.named_parameters(),
@@ -94,7 +95,7 @@ class DACS(UDADecorator):
         self.fdist_lambda = cfg['imnet_feature_dist_lambda']
         self.fdist_classes = cfg['imnet_feature_dist_classes']
         self.fdist_scale_min_ratio = cfg['imnet_feature_dist_scale_min_ratio']
-        self.enable_fdist = self.fdist_lambda > 0
+        self.enable_fdist = False # not relevant in 3D
         self.mix = cfg['mix']
         self.blur = cfg['blur']
         self.color_jitter_s = cfg['color_jitter_strength']
@@ -132,9 +133,14 @@ class DACS(UDADecorator):
 
         # defining dataframe for logging
         self.transform = transforms.Resize((256,256))
+        self.from_3D = cfg.get("from_3D",False)
 
-        with open(f"data/{self.source}/sample_class_stats_dict.json","r") as of:
-            self.sample_class_dict = json.load(of)
+        if self.from_3D:
+            with open(f"data/{self.source}/patch_dataset/sample_class_stats_dict.json","r") as of:
+                self.sample_class_dict = json.load(of)
+        else:
+            with open(f"data/{self.source}/sample_class_stats_dict.json","r") as of:
+                self.sample_class_dict = json.load(of)
 
     def get_ema_model(self):
         return get_module(self.ema_model)
@@ -277,16 +283,20 @@ class DACS(UDADecorator):
         sam_source = sam_source.detach().cpu().squeeze().to(torch.long).numpy()
         pl_source = pl_source.detach().cpu().squeeze().to(torch.long).numpy()
 
-        logging(pl_source, sam_source, gt_source.detach().cpu().squeeze().long().numpy(),pl,self.local_iter,self.train_cfg['work_dir'])
+        #logging(pl_source, sam_source, gt_source.detach().cpu().squeeze().long().numpy(),pl,self.local_iter,self.train_cfg['work_dir'])
 
         out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
         os.makedirs(out_dir, exist_ok=True)
 
-        save_segmentation_map(pl_source,
-                                  sam_source,
-                                  pl, 
-                                  os.path.join(out_dir,
-                                     f'{(self.local_iter + 1):06d}_ema_sam_source.png'))
+        # save_segmentation_map(pl_source,
+        #                           sam_source,
+        #                           pl, 
+        #                           os.path.join(out_dir,
+        #                              f'{(self.local_iter + 1):06d}_ema_sam_source.png'))
+        if self.local_iter + 1 % 1000==0:
+            save_tiff(pl,os.path.join(out_dir,f'{(self.local_iter + 1):06d}_train_pl_raffine.tif'))
+            save_tiff(sam_source,os.path.join(out_dir,f'{(self.local_iter + 1):06d}_train_sam.tif'))
+            save_tiff(pl_source,os.path.join(out_dir,f'{(self.local_iter + 1):06d}_train_ema.tif'))
         
 
         return network, optimizer
@@ -393,18 +403,27 @@ class DACS(UDADecorator):
             pseudo_prob.shape, device=logits.device)
         return pseudo_label, pseudo_weight
 
-    def filter_valid_pseudo_region(self, pseudo_weight, valid_pseudo_mask):
+    def filter_valid_pseudo_region(self, pseudo_weight, valid_pseudo_mask,from_3D=True):
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
             # rectification artifacts. This can lead to a pseudo-label
             # drift from sky towards building or traffic light.
             assert valid_pseudo_mask is None
-            pseudo_weight[:, :self.psweight_ignore_top, :] = 0
+            if from_3D:
+                pseudo_weight[:,:, :self.psweight_ignore_top, :] = 0 # in 3D (B,D,H,W)
+            else :
+                pseudo_weight[:,:self.psweight_ignore_top, :] = 0 # in 2D (B,H,W)
         if self.psweight_ignore_bottom > 0:
             assert valid_pseudo_mask is None
-            pseudo_weight[:, -self.psweight_ignore_bottom:, :] = 0
+            if from_3D:
+                pseudo_weight[:,:, -self.psweight_ignore_bottom:, :] = 0 # in 3D (B,D,H,W)
+            else:
+                pseudo_weight[:,-self.psweight_ignore_bottom:, :] = 0 # sin 2D (B,H,W)
         if valid_pseudo_mask is not None:
-            pseudo_weight *= valid_pseudo_mask.squeeze(1)
+            if from_3D:
+                pseudo_weight *= valid_pseudo_mask
+            else:
+                pseudo_weight *= valid_pseudo_mask.squeeze(1)
         return pseudo_weight
 
     def forward_train(self,
@@ -445,7 +464,10 @@ class DACS(UDADecorator):
         filename = img_metas[0]["filename"]
         filename = filename.replace("gta",self.source)
         oriname = img_metas[0]["ori_filename"]
-        new_name=oriname.replace(".png","_labelTrainIds.png")
+        if "png" in oriname:
+            new_name=oriname.replace(".png","_labelTrainIds.png")
+        else:
+            new_name=oriname.replace(".tif","_labelTrainIds.tif")
 
         gt_filename = filename.replace(f"images/{oriname}",f'labels/{new_name}')
         gt_class_stats = self.sample_class_dict[gt_filename]
@@ -492,7 +514,7 @@ class DACS(UDADecorator):
         self.update_debug_state()
         seg_debug = {}
 
-        means, stds = get_mean_std(img_metas, dev)
+        means, stds = get_mean_std(img_metas, dev,from_3D=True)
         strong_parameters = {
             'mix': None,
             'color_jitter': random.uniform(0, 1),
@@ -506,7 +528,10 @@ class DACS(UDADecorator):
         # Train on source images
         clean_losses = self.get_model().forward_train(
             img, img_metas, gt_semantic_seg, return_feat=True)  #Goes into the hrda_encoder_decoder forward train function
-        src_feat = clean_losses.pop('features')
+        if self.from_3D:
+            pass
+        else:
+            src_feat = clean_losses.pop('features')
         seg_debug['Source'] = self.get_model().debug_output
         clean_loss, clean_log_vars = self._parse_losses(clean_losses)
         log_vars.update(clean_log_vars)
@@ -520,7 +545,7 @@ class DACS(UDADecorator):
             mmcv.print_log(f'Seg. Grad.: {grad_mag}', 'mmseg')
 
         # ImageNet feature distance
-        if self.enable_fdist:
+        if self.enable_fdist and not self.from_3D:
             feat_loss, feat_log = self.calc_feat_dist(img, gt_semantic_seg,
                                                       src_feat)
             log_vars.update(add_prefix(feat_log, 'src'))
@@ -533,7 +558,10 @@ class DACS(UDADecorator):
                 fd_grads = [g2 - g1 for g1, g2 in zip(seg_grads, fd_grads)]
                 grad_mag = calc_grad_magnitude(fd_grads)
                 mmcv.print_log(f'Fdist Grad.: {grad_mag}', 'mmseg')
-        del src_feat, clean_loss
+        if not self.from_3D:
+            del src_feat, clean_loss
+        else :
+            del clean_loss
         if self.enable_fdist:
             del feat_loss
 
@@ -556,7 +584,7 @@ class DACS(UDADecorator):
             os.makedirs(out_dir, exist_ok=True)
 
             pseudo_weight = self.filter_valid_pseudo_region(
-                pseudo_weight, valid_pseudo_mask)
+                pseudo_weight, valid_pseudo_mask,from_3D=True)
             gt_pixel_weight = torch.ones((pseudo_weight.shape), device=dev)
 
 
@@ -567,14 +595,14 @@ class DACS(UDADecorator):
                 if isinstance(m, DropPath):
                     m.training = False
 
-            noise = (self.noise ** 0.5) * torch.randn_like(img,device=img.device,requires_grad=False)
+            #noise = (self.noise ** 0.5) * torch.randn_like(img,device=img.device,requires_grad=False)
             ema_logits_source = self.get_ema_model().generate_pseudo_label(
-                img + noise, img_metas)
+                img , img_metas)
             seg_debug['Source'] = self.get_ema_model().debug_output
 
             pseudo_label_source, pseudo_weight_source = self.get_pseudo_label_and_weight(
                 ema_logits_source)
-            del ema_logits_source, noise
+            del ema_logits_source
 
 
             #pseudo_weight = self.filter_valid_pseudo_region(
@@ -601,103 +629,108 @@ class DACS(UDADecorator):
             #nclasses = classes.shape[0]
             #print("number of classes ?", nclasses)
             #if (self.local_iter < 7500):
-            if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter)) and (self.local_iter < 12500) :
-                self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev)
+            # if (self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter)) and (self.local_iter < 12500) :
+            #     self.network, self.optimizer = self.train_refinement_source(pseudo_label_source, sam_pseudo_label, gt_semantic_seg, self.network, self.optimizer, dev)
 
-            #if (self.local_iter < 7500):
-            if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter):
-                with torch.no_grad():
-                    self.network.eval()
-                    pseudo_label = pseudo_label.unsqueeze(1)
-                    ema = pseudo_label.clone().detach().cpu()
+            # #if (self.local_iter < 7500):
+            # if self.is_sliding_mean_loss_decreased(self.masked_loss_list, self.local_iter):
+            #     with torch.no_grad():
+            #         self.network.eval()
+            #         pseudo_label = pseudo_label.unsqueeze(1)
+            #         ema = pseudo_label.clone().detach().cpu()
         
-                    pseudo_label_ref = self.network(pseudo_label, target_sam)
-                    pseudo_label = pseudo_label.squeeze(1)
+            #         pseudo_label_ref = self.network(pseudo_label, target_sam)
+            #         pseudo_label = pseudo_label.squeeze(1)
 
-                    softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+            #         softmax = torch.nn.Softmax(dim=1)
+            #         # pseudo_label_ref2 = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
 
-                    #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
-                    #plt.show()
-                    #print("unique value", np.unique(pseudo_label.cpu().numpy()))
-                    #print("shape", np.shape(pseudo_label_ref.cpu().numpy()))
+            #         #plt.imshow(gt_semantic_seg[0].cpu().numpy()[0, :, :])
+            #         #plt.show()
+            #         #print("unique value", np.unique(pseudo_label.cpu().numpy()))
+            #         #print("shape", np.shape(pseudo_label_ref.cpu().numpy()))
 
-                    for j in range(batch_size):
-                        rows, cols = 1, 5  # Increase cols to 4 for the new plot
-                        fig, axs = plt.subplots(
-                            rows,
-                            cols,
-                            figsize=(3 * cols, 3 * rows),
-                            gridspec_kw={
-                                'hspace': 0.1,
-                                'wspace': 0.05,
-                                'top': 0.95,
-                                'bottom': 0.05,
-                                'right': 0.95,
-                                'left': 0.05
-                            },
-                        )
+            #         # for j in range(batch_size):
+            #         #     rows, cols = 1, 5  # Increase cols to 4 for the new plot
+            #         #     fig, axs = plt.subplots(
+            #         #         rows,
+            #         #         cols,
+            #         #         figsize=(3 * cols, 3 * rows),
+            #         #         gridspec_kw={
+            #         #             'hspace': 0.1,
+            #         #             'wspace': 0.05,
+            #         #             'top': 0.95,
+            #         #             'bottom': 0.05,
+            #         #             'right': 0.95,
+            #         #             'left': 0.05
+            #         #         },
+            #         #     )
 
-                        # Plot the images
-                        axs[0].imshow(target_img[j].cpu().numpy()[0, :, :])
-                        axs[0].set_title('Target Image')
+            #         #     # Plot the images
+            #         #     axs[0].imshow(target_img[j].cpu().numpy()[0, :, :])
+            #         #     axs[0].set_title('Target Image')
 
-                        axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap='gray')
-                        axs[1].set_title('Pseudo Label')
+            #         #     axs[1].imshow(pseudo_label[j].cpu().numpy()[:, :], cmap='gray')
+            #         #     axs[1].set_title('Pseudo Label')
 
-                        axs[2].imshow(target_sam[j].cpu().numpy()[0, :, :], cmap='gray')
-                        axs[2].set_title('Target SAM')
+            #         #     axs[2].imshow(target_sam[j].cpu().numpy()[0, :, :], cmap='gray')
+            #         #     axs[2].set_title('Target SAM')
 
-                        axs[3].imshow(pseudo_label_ref[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
-                        axs[3].set_title('Pseudo Label Ref')
+            #         #     axs[3].imshow(pseudo_label_ref[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
+            #         #     axs[3].set_title('Pseudo Label Ref')
 
-                        axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
-                        axs[4].set_title('pl_after_post')
+            #         #     axs[4].imshow(pseudo_label_ref2[j].cpu().numpy()[0, :, :], cmap='gray')  # New plot
+            #         #     axs[4].set_title('pl_after_post')
 
-                        # Turn off axis for all subplots
-                        for ax in axs.flat:
-                            ax.axis('off')
+            #         #     # Turn off axis for all subplots
+            #         #     for ax in axs.flat:
+            #         #         ax.axis('off')
 
-                        # Save the figure
-                        out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
-                        os.makedirs(out_dir, exist_ok=True)
-                        plt.savefig(
-                            os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
-                        )
-                        plt.close()
+            #         #     # Save the figure
+            #         #     out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+            #         #     os.makedirs(out_dir, exist_ok=True)
+            #         #     plt.savefig(
+            #         #         os.path.join(out_dir, f'{(self.local_iter + 1):06d}_{j}_new.png')
+            #         #     )
+            #         #     plt.close()
 
-                    #For binary segmentation
-                    #target_sam = target_sam.squeeze(1)  # Removes the singleton dimension
-                    #pseudo_label = (pseudo_label_ref.squeeze(1)>0.5).long()
+            #         #For binary segmentation
+            #         #target_sam = target_sam.squeeze(1)  # Removes the singleton dimension
+            #         #pseudo_label = (pseudo_label_ref.squeeze(1)>0.5).long()
                     
-                    #For multilabel segmentation
-                    softmax = torch.nn.Softmax(dim=1)
-                    pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
+            #         #For multilabel segmentation
+            #         softmax = torch.nn.Softmax(dim=1)
+            #         pseudo_label = torch.argmax(softmax(pseudo_label_ref),axis=1).unsqueeze(1)
 
-                    #Let it uncommented for both
-                    pseudo_label = pseudo_label.squeeze(1)
+            #         #Let it uncommented for both
+            #         pseudo_label = pseudo_label.squeeze(1)
 
-                    pl = pseudo_label.clone().detach().cpu()
-                    #print("pseudo_label shape",pseudo_label.shape)
-                    #pseudo_label = F.interpolate(pseudo_label.unsqueeze(1),size=(1024,1024),mode='nearest').to(torch.long)
-                    pseudo_label = pseudo_label.squeeze(1)
+            #         pl = pseudo_label.clone().detach().cpu()
+            #         #print("pseudo_label shape",pseudo_label.shape)
+            #         #pseudo_label = F.interpolate(pseudo_label.unsqueeze(1),size=(1024,1024),mode='nearest').to(torch.long)
+            #         pseudo_label = pseudo_label.squeeze(1)
 
-                    # target gt
-                    target_file_name = target_img_metas[0]["filename"].replace("images","labels")
-                    img_target = Image.open(target_file_name ).convert("P")
-                    target_gt = torch.from_numpy(np.array(self.transform(img_target))).unsqueeze(0).unsqueeze(0)
-                    target_gt = F.interpolate(target_gt,size=(1024,1024),mode='nearest').to(torch.long).squeeze().numpy()
-                    target_sam = target_sam.squeeze().long().detach().cpu().numpy()
-                    ema = ema.squeeze().long().cpu().numpy()
-                    pl = pl.squeeze().long().cpu()
-                    logging(ema, target_sam, target_gt,pl.long().numpy(),self.local_iter,self.train_cfg['work_dir'],False)
-                    del ema,pl
+
+            #         # target gt
+            #         # target_file_name = target_img_metas[0]["filename"].replace("images","labels")
+            #         # img_target = Image.open(target_file_name ).convert("P")
+            #         # target_gt = torch.from_numpy(np.array(self.transform(img_target))).unsqueeze(0).unsqueeze(0)
+            #         # target_gt = F.interpolate(target_gt,size=(1024,1024),mode='nearest').to(torch.long).squeeze().numpy()
+            #         target_sam = target_sam.squeeze().long().detach().cpu().numpy()
+            #         ema = ema.squeeze().long().cpu().numpy()
+            #         pl = pl.squeeze().long().cpu()
+            #         # #logging(ema, target_sam, target_gt,pl.long().numpy(),self.local_iter,self.train_cfg['work_dir'],False)
+            #         if self.local_iter + 1 % 1000==0:
+            #             save_tiff(pl,os.path.join(out_dir,f'{(self.local_iter + 1):06d}_train_pl_raffine.tif'))
+            #             save_tiff(target_sam,os.path.join(out_dir,f'{(self.local_iter + 1):06d}_train_sam.tif'))
+            #             save_tiff(ema,os.path.join(out_dir,f'{(self.local_iter + 1):06d}_train_ema.tif'))
+            #         del ema,pl
                 
 
             # Apply mixing
             mixed_img, mixed_lbl = [None] * batch_size, [None] * batch_size
             mixed_seg_weight = pseudo_weight.clone()
-            mix_masks = get_class_masks(gt_semantic_seg)
+            mix_masks = get_class_masks(gt_semantic_seg,from_3D=True) # for 3D, set from_3D to True
 
             for i in range(batch_size):
                 strong_parameters['mix'] = mix_masks[i]
@@ -712,6 +745,9 @@ class DACS(UDADecorator):
             del gt_pixel_weight
             mixed_img = torch.cat(mixed_img)
             mixed_lbl = torch.cat(mixed_lbl)
+
+            print("pseudo_weight in dacs",pseudo_weight.shape)
+            print("mixed_img",mixed_img.shape)
 
             # Train on mixed images
             mix_losses = self.get_model().forward_train(
@@ -741,110 +777,110 @@ class DACS(UDADecorator):
             self.masked_loss_list.append(masked_loss.item())
             self.plot_loss_evolution(self.masked_loss_list,plot_name="masked_loss.png")
 
-        if self.local_iter % self.debug_img_interval == 0 and \
-                not self.source_only:
-            out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
-            os.makedirs(out_dir, exist_ok=True)
-            vis_img = torch.clamp(denorm(img, means, stds), 0, 1)
-            vis_trg_img = torch.clamp(denorm(target_img, means, stds), 0, 1)
-            vis_mixed_img = torch.clamp(denorm(mixed_img, means, stds), 0, 1)
-            for j in range(batch_size):
-                rows, cols = 2, 5
-                fig, axs = plt.subplots(
-                    rows,
-                    cols,
-                    figsize=(3 * cols, 3 * rows),
-                    gridspec_kw={
-                        'hspace': 0.1,
-                        'wspace': 0,
-                        'top': 0.95,
-                        'bottom': 0,
-                        'right': 1,
-                        'left': 0
-                    },
-                )
-                subplotimg(axs[0][0], vis_img[j], 'Source Image')
-                subplotimg(axs[1][0], vis_trg_img[j], 'Target Image')
-                subplotimg(
-                    axs[0][1],
-                    gt_semantic_seg[j],
-                    'Source Seg GT',
-                    cmap='cityscapes')
-                subplotimg(
-                    axs[1][1],
-                    pseudo_label[j],
-                    'Target Seg (Pseudo) GT',
-                    cmap='cityscapes')
-                subplotimg(axs[0][2], vis_mixed_img[j], 'Mixed Image')
-                subplotimg(
-                    axs[1][2], mix_masks[j][0], 'Domain Mask', cmap='gray')
-                # subplotimg(axs[0][3], pred_u_s[j], "Seg Pred",
-                #            cmap="cityscapes")
-                if mixed_lbl is not None:
-                    subplotimg(
-                        axs[1][3], mixed_lbl[j], 'Seg Targ', cmap='cityscapes')
-                subplotimg(
-                    axs[0][3],
-                    mixed_seg_weight[j],
-                    'Pseudo W.',
-                    vmin=0,
-                    vmax=1)
-                if self.debug_fdist_mask is not None:
-                    subplotimg(
-                        axs[0][4],
-                        self.debug_fdist_mask[j][0],
-                        'FDist Mask',
-                        cmap='gray')
-                if self.debug_gt_rescale is not None:
-                    subplotimg(
-                        axs[1][4],
-                        self.debug_gt_rescale[j],
-                        'Scaled GT',
-                        cmap='cityscapes')
-                for ax in axs.flat:
-                    ax.axis('off')
-                plt.savefig(
-                    os.path.join(out_dir,
-                                 f'{(self.local_iter + 1):06d}_{j}.png'))
-                plt.close()
+        # if self.local_iter % self.debug_img_interval == 0 and \
+        #         not self.source_only:
+        #     out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+        #     os.makedirs(out_dir, exist_ok=True)
+        #     vis_img = torch.clamp(denorm(img, means, stds), 0, 1)
+        #     vis_trg_img = torch.clamp(denorm(target_img, means, stds), 0, 1)
+        #     vis_mixed_img = torch.clamp(denorm(mixed_img, means, stds), 0, 1)
+        #     for j in range(batch_size):
+        #         rows, cols = 2, 5
+        #         fig, axs = plt.subplots(
+        #             rows,
+        #             cols,
+        #             figsize=(3 * cols, 3 * rows),
+        #             gridspec_kw={
+        #                 'hspace': 0.1,
+        #                 'wspace': 0,
+        #                 'top': 0.95,
+        #                 'bottom': 0,
+        #                 'right': 1,
+        #                 'left': 0
+        #             },
+        #         )
+        #         subplotimg(axs[0][0], vis_img[j], 'Source Image')
+        #         subplotimg(axs[1][0], vis_trg_img[j], 'Target Image')
+        #         subplotimg(
+        #             axs[0][1],
+        #             gt_semantic_seg[j],
+        #             'Source Seg GT',
+        #             cmap='cityscapes')
+        #         subplotimg(
+        #             axs[1][1],
+        #             pseudo_label[j],
+        #             'Target Seg (Pseudo) GT',
+        #             cmap='cityscapes')
+        #         subplotimg(axs[0][2], vis_mixed_img[j], 'Mixed Image')
+        #         subplotimg(
+        #             axs[1][2], mix_masks[j][0], 'Domain Mask', cmap='gray')
+        #         # subplotimg(axs[0][3], pred_u_s[j], "Seg Pred",
+        #         #            cmap="cityscapes")
+        #         if mixed_lbl is not None:
+        #             subplotimg(
+        #                 axs[1][3], mixed_lbl[j], 'Seg Targ', cmap='cityscapes')
+        #         subplotimg(
+        #             axs[0][3],
+        #             mixed_seg_weight[j],
+        #             'Pseudo W.',
+        #             vmin=0,
+        #             vmax=1)
+        #         if self.debug_fdist_mask is not None:
+        #             subplotimg(
+        #                 axs[0][4],
+        #                 self.debug_fdist_mask[j][0],
+        #                 'FDist Mask',
+        #                 cmap='gray')
+        #         if self.debug_gt_rescale is not None:
+        #             subplotimg(
+        #                 axs[1][4],
+        #                 self.debug_gt_rescale[j],
+        #                 'Scaled GT',
+        #                 cmap='cityscapes')
+        #         for ax in axs.flat:
+        #             ax.axis('off')
+        #         plt.savefig(
+        #             os.path.join(out_dir,
+        #                          f'{(self.local_iter + 1):06d}_{j}.png'))
+        #         plt.close()
 
-        if self.local_iter % self.debug_img_interval == 0:
-            out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
-            os.makedirs(out_dir, exist_ok=True)
-            if seg_debug['Source'] is not None and seg_debug:
-                if 'Target' in seg_debug:
-                    seg_debug['Target']['Pseudo W.'] = mixed_seg_weight.cpu(
-                    ).numpy()
-                for j in range(batch_size):
-                    cols = len(seg_debug)
-                    rows = max(len(seg_debug[k]) for k in seg_debug.keys())
-                    fig, axs = plt.subplots(
-                        rows,
-                        cols,
-                        figsize=(5 * cols, 5 * rows),
-                        gridspec_kw={
-                            'hspace': 0.1,
-                            'wspace': 0,
-                            'top': 0.95,
-                            'bottom': 0,
-                            'right': 1,
-                            'left': 0
-                        },
-                        squeeze=False,
-                    )
-                    for k1, (n1, outs) in enumerate(seg_debug.items()):
-                        for k2, (n2, out) in enumerate(outs.items()):
-                            subplotimg(
-                                axs[k2][k1],
-                                **prepare_debug_out(f'{n1} {n2}', out[j],
-                                                    means, stds))
-                    for ax in axs.flat:
-                        ax.axis('off')
-                    plt.savefig(
-                        os.path.join(out_dir,
-                                     f'{(self.local_iter + 1):06d}_{j}_s.png'))
-                    plt.close()
-                del seg_debug
+        # if self.local_iter % self.debug_img_interval == 0:
+        #     out_dir = os.path.join(self.train_cfg['work_dir'], 'debug')
+        #     os.makedirs(out_dir, exist_ok=True)
+        #     if seg_debug['Source'] is not None and seg_debug:
+        #         if 'Target' in seg_debug:
+        #             seg_debug['Target']['Pseudo W.'] = mixed_seg_weight.cpu(
+        #             ).numpy()
+        #         for j in range(batch_size):
+        #             cols = len(seg_debug)
+        #             rows = max(len(seg_debug[k]) for k in seg_debug.keys())
+        #             fig, axs = plt.subplots(
+        #                 rows,
+        #                 cols,
+        #                 figsize=(5 * cols, 5 * rows),
+        #                 gridspec_kw={
+        #                     'hspace': 0.1,
+        #                     'wspace': 0,
+        #                     'top': 0.95,
+        #                     'bottom': 0,
+        #                     'right': 1,
+        #                     'left': 0
+        #                 },
+        #                 squeeze=False,
+        #             )
+        #             for k1, (n1, outs) in enumerate(seg_debug.items()):
+        #                 for k2, (n2, out) in enumerate(outs.items()):
+        #                     subplotimg(
+        #                         axs[k2][k1],
+        #                         **prepare_debug_out(f'{n1} {n2}', out[j],
+        #                                             means, stds))
+        #             for ax in axs.flat:
+        #                 ax.axis('off')
+        #             plt.savefig(
+        #                 os.path.join(out_dir,
+        #                              f'{(self.local_iter + 1):06d}_{j}_s.png'))
+        #             plt.close()
+        #         del seg_debug
         self.local_iter += 1
 
         return log_vars
@@ -880,3 +916,5 @@ def logging(pl_source, sam_source, gt_source, pl, iteration,out_dir, is_train=Tr
 
         df.to_csv(save_dir, index=False)
 
+def save_tiff(data,out_dir):
+    tiff.imwrite(out_dir, data.astype(np.uint8))

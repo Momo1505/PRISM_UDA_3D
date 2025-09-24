@@ -23,17 +23,17 @@ def strong_transform(param, data=None, target=None):
     return data, target
 
 
-def get_mean_std(img_metas, dev):
+def get_mean_std(img_metas, dev,from_3D=False):
     mean = [
         torch.as_tensor(img_metas[i]['img_norm_cfg']['mean'], device=dev)
         for i in range(len(img_metas))
     ]
-    mean = torch.stack(mean).view(-1, 3, 1, 1)
+    mean = torch.stack(mean).view(-1, 3, 1, 1) if not from_3D else torch.stack(mean).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     std = [
         torch.as_tensor(img_metas[i]['img_norm_cfg']['std'], device=dev)
         for i in range(len(img_metas))
     ]
-    std = torch.stack(std).view(-1, 3, 1, 1)
+    std = torch.stack(std).view(-1, 3, 1, 1) if not from_3D else torch.stack(std).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
     return mean, std
 
 
@@ -87,21 +87,26 @@ def gaussian_blur(blur, data=None, target=None):
     return data, target
 
 
-def get_class_masks(labels):
+def get_class_masks(labels,from_3D=False):
     class_masks = []
     for label in labels:
-        classes = torch.unique(labels)
+        classes = torch.unique(label)
         nclasses = classes.shape[0]
         class_choice = np.random.choice(
             nclasses, int((nclasses + nclasses % 2) / 2), replace=False)
         classes = classes[torch.Tensor(class_choice).long()]
-        class_masks.append(generate_class_mask(label, classes).unsqueeze(0))
+        class_masks.append(generate_class_mask(label, classes,from_3D).unsqueeze(0))
     return class_masks
 
 
-def generate_class_mask(label, classes):
-    label, classes = torch.broadcast_tensors(label,
+def generate_class_mask(label, classes,from_3D=False):
+    if from_3D:
+        label, classes = torch.broadcast_tensors(label,
+                                             classes.unsqueeze(1).unsqueeze(2).unsqueeze(3))
+    else:
+        label, classes = torch.broadcast_tensors(label,
                                              classes.unsqueeze(1).unsqueeze(2))
+    
     class_mask = label.eq(classes).sum(0, keepdims=True)
     return class_mask
 

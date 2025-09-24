@@ -25,17 +25,25 @@ class BlockMaskGenerator:
         self.mask_block_size = mask_block_size
 
     @torch.no_grad()
-    def generate_mask(self, imgs):
-        B, _, H, W = imgs.shape
+    def generate_mask(self, imgs,from_3D=False):  # make a 3D version
+        if from_3D:
+            B, _,D, H, W = imgs.shape
+            mshape = B, 1,round(D / self.mask_block_size), round(H / self.mask_block_size), round(
+                W / self.mask_block_size)
+            input_mask = torch.rand(mshape, device=imgs.device)
+            input_mask = (input_mask > self.mask_ratio).float()
+            input_mask = resize(input_mask, size=(D,H, W))
+        else:
+            B, _, H, W = imgs.shape
 
-        mshape = B, 1, round(H / self.mask_block_size), round(
-            W / self.mask_block_size)
-        input_mask = torch.rand(mshape, device=imgs.device)
-        input_mask = (input_mask > self.mask_ratio).float()
-        input_mask = resize(input_mask, size=(H, W))
+            mshape = B, 1, round(H / self.mask_block_size), round(
+                W / self.mask_block_size)
+            input_mask = torch.rand(mshape, device=imgs.device)
+            input_mask = (input_mask > self.mask_ratio).float()
+            input_mask = resize(input_mask, size=(H, W))
         return input_mask
 
     @torch.no_grad()
-    def mask_image(self, imgs):
-        input_mask = self.generate_mask(imgs)
+    def mask_image(self, imgs,from_3D=False):
+        input_mask = self.generate_mask(imgs,from_3D=from_3D)
         return imgs * input_mask
