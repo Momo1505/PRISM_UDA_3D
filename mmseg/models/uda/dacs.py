@@ -403,27 +403,18 @@ class DACS(UDADecorator):
             pseudo_prob.shape, device=logits.device)
         return pseudo_label, pseudo_weight
 
-    def filter_valid_pseudo_region(self, pseudo_weight, valid_pseudo_mask,from_3D=True):
+    def filter_valid_pseudo_region(self, pseudo_weight, valid_pseudo_mask):
         if self.psweight_ignore_top > 0:
             # Don't trust pseudo-labels in regions with potential
             # rectification artifacts. This can lead to a pseudo-label
             # drift from sky towards building or traffic light.
             assert valid_pseudo_mask is None
-            if from_3D:
-                pseudo_weight[:,:, :self.psweight_ignore_top, :] = 0 # in 3D (B,D,H,W)
-            else :
-                pseudo_weight[:,:self.psweight_ignore_top, :] = 0 # in 2D (B,H,W)
+            pseudo_weight[:, :self.psweight_ignore_top, :] = 0
         if self.psweight_ignore_bottom > 0:
             assert valid_pseudo_mask is None
-            if from_3D:
-                pseudo_weight[:,:, -self.psweight_ignore_bottom:, :] = 0 # in 3D (B,D,H,W)
-            else:
-                pseudo_weight[:,-self.psweight_ignore_bottom:, :] = 0 # sin 2D (B,H,W)
+            pseudo_weight[:, -self.psweight_ignore_bottom:, :] = 0
         if valid_pseudo_mask is not None:
-            if from_3D:
-                pseudo_weight *= valid_pseudo_mask
-            else:
-                pseudo_weight *= valid_pseudo_mask.squeeze(1)
+            pseudo_weight *= valid_pseudo_mask.squeeze(1)
         return pseudo_weight
 
     def forward_train(self,
@@ -584,7 +575,7 @@ class DACS(UDADecorator):
             os.makedirs(out_dir, exist_ok=True)
 
             pseudo_weight = self.filter_valid_pseudo_region(
-                pseudo_weight, valid_pseudo_mask,from_3D=True)
+                pseudo_weight, valid_pseudo_mask)
             gt_pixel_weight = torch.ones((pseudo_weight.shape), device=dev)
 
 
