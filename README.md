@@ -24,7 +24,7 @@ from their [OneDrive](https://connecthkuhk-my.sharepoint.com/:f:/g/personal/xiee
 
 ## Adding a new experiment 
 
-To create a new experiment (for instance, on a new datasets), you will have to create two new file : test
+To create a new experiment (for instance, on a new datasets), you will have to create two new file :
 - a config file, following the example that you can find in ```configs/mic/sample_config.py```and by correctly replacing ```NAME_OF_DATASET_FILE.py```, ```EXPERIMENT_NAME```and ```DATASET_NAME```.
 - a dataset file, following the example that you can find in ```configs/_base_/datasets/sample_datasets.py``` and by correcly replacing ```ROOT_TO_SOURCE_DATASET``` and ```ROOT_TO_TARGET_DATASET```, know that only ``.tif`` files are currently suported for 3D data. If you want to use any other file extension, adapt the ``I3toLW4Dataset`` in ``mmseg/datasets/gta.py``.
 For reminder, MMSEG is a framework originally created for 2D image segmentation, so for volume data, I needed to adapt some preprocessing. If you want to know what changes I made, look into any other files that does not have ``3D`` in their name, so that when you launch the training (presented below), and you encouter bugs,  you will know where to look.
